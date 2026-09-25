@@ -6497,19 +6497,23 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
               Stream.runHead,
               Effect.map(Option.getOrThrow),
             );
-            const invoked = yield* client[WS_METHODS.pluginCommandsInvoke]({
-              generation: listed.generation,
-              id: "t3.plugin-runtime.status",
-            });
-            return { invoked, listed, streamed };
+            const missing = yield* Effect.flip(
+              client[WS_METHODS.pluginCommandsInvoke]({
+                generation: listed.generation,
+                id: "com.acme.missing",
+              }),
+            );
+            return { listed, missing, streamed };
           }),
         ),
       );
 
+      // No plugins are installed, so there are no commands.
+      assert.deepEqual(result.listed, { commands: [], generation: 0 });
       assert.deepEqual(result.streamed, result.listed);
-      assert.deepEqual(result.invoked, {
-        message: "Plugin runtime is active.",
-        tone: "success",
+      assert.deepInclude(result.missing, {
+        _tag: "PluginCommandNotFoundError",
+        id: "com.acme.missing",
       });
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );

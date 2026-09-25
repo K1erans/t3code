@@ -230,12 +230,12 @@ it.layer(NodeServices.layer)("plugin package lifecycle", (it) => {
           expect(status.packages[0]?.error).toBeUndefined();
           const listed = yield* catalog.list;
           expect(listed.commands.map((command) => command.id)).not.toContain(commandId);
+          // Invocations answer without waiting for the activation.
           expect(
-            yield* manager.invokeCommand({
-              generation: listed.generation,
-              id: "t3.plugin-runtime.status",
-            }),
-          ).toMatchObject({ tone: "success" });
+            (yield* Effect.flip(
+              manager.invokeCommand({ generation: listed.generation, id: commandId }),
+            ))._tag,
+          ).toBe("PluginCommandNotFoundError");
 
           release();
           expect(yield* manager.rescan).toMatchObject({

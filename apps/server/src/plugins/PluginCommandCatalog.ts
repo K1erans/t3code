@@ -93,25 +93,6 @@ export const registerPluginCommand = (
   );
 };
 
-const builtInPlugin: PluginDefinition = {
-  id: "t3.plugin-runtime.commands",
-  version: "1.0.0",
-  activate(context) {
-    registerPluginCommand(context, {
-      command: {
-        id: "t3.plugin-runtime.status",
-        label: "Check plugin runtime",
-        description: "Verify that the environment plugin runtime is responding.",
-        surfaces: ["web", "desktop", "mobile"],
-      },
-      handler: Effect.succeed({
-        message: "Plugin runtime is active.",
-        tone: "success",
-      }),
-    });
-  },
-};
-
 const catalogFromRuntime = Effect.fn("PluginCommandCatalog.catalogFromRuntime")(function* (
   runtime: PluginRuntime.PluginRuntime["Service"],
 ) {
@@ -163,9 +144,7 @@ export const make = Effect.gen(function* () {
       reconcileSemaphore.withPermits(1)(
         Effect.uninterruptibleMask((restore) =>
           Effect.gen(function* () {
-            const transitionExit = yield* Effect.exit(
-              restore(runtime.reconcile([builtInPlugin, ...definitions])),
-            );
+            const transitionExit = yield* Effect.exit(restore(runtime.reconcile(definitions)));
             const catalog = yield* catalogFromRuntime(runtime);
             const previous = yield* SubscriptionRef.get(state);
             const published =

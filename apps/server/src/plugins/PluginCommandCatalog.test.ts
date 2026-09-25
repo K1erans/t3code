@@ -43,24 +43,24 @@ describe("plugin command catalog", () => {
     expect(error.message).toBe("Plugin command acme.hello failed during execution.");
   });
 
-  it.effect("lists and invokes the trusted built-in command", () =>
+  it.effect("starts empty, then lists and invokes a plugin's commands", () =>
     Effect.gen(function* () {
       const catalog = yield* PluginCommandCatalog.PluginCommandCatalog;
+      expect((yield* catalog.list).commands).toEqual([]);
+      yield* catalog.reconcile([testPlugin({ message: "hello one", version: "1.0.0" })]);
       const listed = yield* catalog.list;
       const streamed = yield* Stream.runHead(catalog.changes);
 
-      expect(listed.commands.map((command) => command.id)).toContain("t3.plugin-runtime.status");
+      expect(listed.commands.map((command) => command.id)).toEqual(["acme.hello"]);
       expect(Object.isFrozen(listed)).toBe(true);
       expect(Object.isFrozen(listed.commands)).toBe(true);
       expect(Object.isFrozen(listed.commands[0])).toBe(true);
       expect(Object.isFrozen(listed.commands[0]?.surfaces)).toBe(true);
       expect(Option.getOrNull(streamed)).toEqual(listed);
-      expect(
-        yield* catalog.invoke({
-          generation: listed.generation,
-          id: "t3.plugin-runtime.status",
-        }),
-      ).toEqual({ message: "Plugin runtime is active.", tone: "success" });
+      expect(yield* catalog.invoke({ generation: listed.generation, id: "acme.hello" })).toEqual({
+        message: "hello one",
+        tone: "success",
+      });
     }).pipe(Effect.provide(PluginCommandCatalog.layer)),
   );
 
@@ -98,7 +98,8 @@ describe("plugin command catalog", () => {
   it.effect("rolls back invalid command metadata before publishing a generation", () =>
     Effect.gen(function* () {
       const catalog = yield* PluginCommandCatalog.PluginCommandCatalog;
-      const first = yield* catalog.list;
+      const valid = testPlugin({ message: "hello one", version: "1.0.0" });
+      const first = yield* catalog.reconcile([valid]);
       const invalid: PluginDefinition = {
         id: "acme.invalid-command-plugin",
         version: "1.0.0",
@@ -115,7 +116,7 @@ describe("plugin command catalog", () => {
         },
       };
 
-      const failed = yield* Effect.exit(catalog.reconcile([invalid]));
+      const failed = yield* Effect.exit(catalog.reconcile([valid, invalid]));
 
       const shadowedIdentity: PluginDefinition = {
         id: "acme.shadowed-command-plugin",
@@ -136,17 +137,15 @@ describe("plugin command catalog", () => {
           );
         },
       };
-      const shadowed = yield* Effect.exit(catalog.reconcile([shadowedIdentity]));
+      const shadowed = yield* Effect.exit(catalog.reconcile([valid, shadowedIdentity]));
 
       expect(Exit.isFailure(failed)).toBe(true);
       expect(Exit.isFailure(shadowed)).toBe(true);
       expect(yield* catalog.list).toBe(first);
-      expect(
-        yield* catalog.invoke({
-          generation: first.generation,
-          id: "t3.plugin-runtime.status",
-        }),
-      ).toEqual({ message: "Plugin runtime is active.", tone: "success" });
+      expect(yield* catalog.invoke({ generation: first.generation, id: "acme.hello" })).toEqual({
+        message: "hello one",
+        tone: "success",
+      });
     }).pipe(Effect.provide(PluginCommandCatalog.layer)),
   );
 
