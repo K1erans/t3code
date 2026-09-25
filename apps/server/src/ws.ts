@@ -2366,7 +2366,7 @@ const makeWsRpcLayer = (
             "rpc.aggregate": "pluginCommands",
           }),
         [WS_METHODS.pluginCommandsInvoke]: (input) =>
-          observeRpcEffect(WS_METHODS.pluginCommandsInvoke, pluginCommands.invoke(input), {
+          observeRpcEffect(WS_METHODS.pluginCommandsInvoke, pluginPackages.invokeCommand(input), {
             "rpc.aggregate": "pluginCommands",
           }),
         [WS_METHODS.pluginPackagesStatus]: (_input) =>
