@@ -1,0 +1,14 @@
+<!doctype html>
+<!-- PROTOTYPE — served from /api/plugins/<token>/screen/ in a sandboxed, opaque-origin iframe. -->
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <!-- DECIDE: does the host inject T3's theme variables, or does the author link a stylesheet the SDK ships? -->
+    <link rel="stylesheet" href="./board.css" />
+  </head>
+  <body>
+    <form id="add"><input name="title" placeholder="New card" /><button>Add</button></form>
+    <ul id="cards"></ul>
+    <script type="module" src="./board.js"></script>
+  </body>
+</html>

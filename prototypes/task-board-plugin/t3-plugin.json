@@ -1,0 +1,29 @@
+{
+  "manifestVersion": 1,
+  "id": "com.example.task-board",
+  "name": "Task board",
+  "version": "0.1.0",
+  "requires": [
+    "t3.screens@1",
+    "t3.storage@1",
+    "t3.threads@1"
+  ],
+  "surfaces": [
+    "web",
+    "desktop"
+  ],
+  "entrypoints": {
+    "server": "./dist/server.js"
+  },
+  "contributes": {
+    "screens": [
+      {
+        "id": "board",
+        "title": "Task board",
+        "entry": "./dist/screen/index.html",
+        "scope": "project",
+        "placement": "panel"
+      }
+    ]
+  }
+}
