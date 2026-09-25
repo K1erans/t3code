@@ -1,7 +1,8 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { ServerSettingsError } from "@t3tools/contracts";
+import { PluginCommandInvocationError, ServerSettingsError } from "@t3tools/contracts";
 import { it } from "@effect/vitest";
-import { expect } from "vite-plus/test";
+import { describe, expect } from "vite-plus/test";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
@@ -13,6 +14,7 @@ import { PluginManifest } from "@t3tools/plugin-runtime/manifest";
 
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as ServerConfig from "../config.ts";
+import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as PluginCommandCatalog from "./PluginCommandCatalog.ts";
 import * as PluginPackageManager from "./PluginPackageManager.ts";
@@ -103,6 +105,7 @@ export default function activate(api) {
 `;
 
 interface EnvironmentLayerOptions {
+  readonly entryPointTimeout?: Duration.Input;
   readonly persistenceFailures?: { remaining: number };
   readonly startupFailure?: boolean;
 }
@@ -111,6 +114,7 @@ const makeEnvironmentLayer = (baseDir: string, options?: EnvironmentLayerOptions
   const configLayer = Layer.fresh(ServerConfig.layerTest(process.cwd(), baseDir));
   const liveSettingsLayer = ServerSettings.layer.pipe(
     Layer.provide(ServerSecretStore.layer),
+    Layer.provide(Layer.fresh(SqlitePersistenceMemory)),
     Layer.provideMerge(configLayer),
   );
   const persistenceFailures = options?.persistenceFailures;
@@ -151,7 +155,10 @@ const makeEnvironmentLayer = (baseDir: string, options?: EnvironmentLayerOptions
           }),
         ).pipe(Layer.provide(liveSettingsLayer));
 
-  return PluginPackageManager.layer.pipe(
+  const entryPointTimeout = options?.entryPointTimeout;
+  return PluginPackageManager.layerWith(
+    entryPointTimeout === undefined ? {} : { entryPointTimeout },
+  ).pipe(
     Layer.provideMerge(PluginCommandCatalog.layer),
     Layer.provideMerge(settingsLayer),
     Layer.provideMerge(configLayer),
@@ -349,13 +356,15 @@ it.layer(NodeServices.layer)("plugin package lifecycle", (it) => {
                 version: "1.0.0",
                 enabled: true,
                 state: "error",
-                error: "activation failed",
+                error: "activate threw: activation failed",
               },
             ],
           });
           yield* manager.enable(packageId);
           expect(yield* manager.status).toMatchObject({
-            packages: [{ id: packageId, state: "error", error: "activation failed" }],
+            packages: [
+              { id: packageId, state: "error", error: "activate threw: activation failed" },
+            ],
           });
 
           yield* fileSystem.writeFileString(
@@ -532,7 +541,7 @@ it.layer(NodeServices.layer)("plugin package lifecycle", (it) => {
                 id: packageId,
                 enabled: false,
                 state: "error",
-                error: "cleanup exploded",
+                error: "dispose threw: cleanup exploded",
               },
             ],
           });
@@ -607,4 +616,175 @@ it.layer(NodeServices.layer)("plugin package lifecycle", (it) => {
       expect(decodePersistedEnabledPlugins(persisted).enabledPluginIds ?? []).toEqual([]);
     }),
   );
+});
+
+const healthyPackageId = "com.acme.healthy";
+const healthyCommandId = "acme.healthy";
+
+const writePackage = (baseDir: string, id: string, command: string, source: string) =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const packageDirectory = `${baseDir}/userdata/plugins/${id}`;
+    yield* fileSystem.makeDirectory(packageDirectory, { recursive: true });
+    yield* fileSystem.writeFileString(
+      `${packageDirectory}/t3-plugin.json`,
+      encodeManifest({ ...manifest, id, contributes: { commands: [command] } }),
+    );
+    yield* fileSystem.writeFileString(`${packageDirectory}/index.mjs`, source);
+    return packageDirectory;
+  });
+
+const commandPluginSource = (handlerSource: string, disposalFile: string) => `
+import { appendFile } from "node:fs/promises";
+
+export default function activate(api) {
+  api.registerCommand(
+    { id: "${commandId}", label: "Failing command", surfaces: ["web", "desktop", "mobile"] },
+    ${handlerSource}
+  );
+  api.onDispose(() => appendFile(${encodeJsonString(disposalFile)}, "disposed\\n"));
+}
+`;
+
+const healthySource = `
+export default function activate(api) {
+  api.registerCommand(
+    { id: "${healthyCommandId}", label: "Healthy", surfaces: ["web", "desktop", "mobile"] },
+    () => ({ message: "still healthy", tone: "success" })
+  );
+}
+`;
+
+const encodeInvocationError = Schema.encodeUnknownSync(
+  Schema.fromJsonString(PluginCommandInvocationError),
+);
+
+const failureCases = [
+  {
+    outcome: "threw",
+    activate: "throw new Error('boom')",
+    handler: "() => { throw new Error('boom') }",
+  },
+  {
+    outcome: "rejected",
+    activate: "return Promise.reject(new Error('boom'))",
+    handler: "async () => { throw new Error('boom') }",
+  },
+  {
+    outcome: "timed out",
+    activate: "return new Promise(() => {})",
+    handler: "() => new Promise(() => {})",
+  },
+] as const;
+
+const expectedMessage = (outcome: string) =>
+  outcome === "timed out" ? "did not finish within 50ms" : "boom";
+
+// Live clock: the timeout cases exercise the real entry point timer.
+describe("plugin failure containment", () => {
+  for (const { outcome, activate } of failureCases) {
+    it.live(`marks only the plugin whose activate ${outcome} as failed`, () =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3code-plugin-activate-failure-test-",
+        });
+        yield* writePackage(
+          baseDir,
+          packageId,
+          commandId,
+          `export default function activate() { ${activate} }`,
+        );
+        yield* writePackage(baseDir, healthyPackageId, healthyCommandId, healthySource);
+
+        yield* useEnvironment(
+          baseDir,
+          Effect.gen(function* () {
+            const manager = yield* PluginPackageManager.PluginPackageManager;
+            const catalog = yield* PluginCommandCatalog.PluginCommandCatalog;
+            yield* manager.enable(healthyPackageId);
+            expect((yield* Effect.exit(manager.enable(packageId)))._tag).toBe("Failure");
+
+            const status = yield* manager.status;
+            expect(status.packages).toMatchObject([
+              { id: healthyPackageId, state: "active" },
+              {
+                id: packageId,
+                state: "error",
+                error: `activate ${outcome}: ${expectedMessage(outcome)}`,
+              },
+            ]);
+            const listed = yield* catalog.list;
+            expect(listed.commands.map((command) => command.id)).not.toContain(commandId);
+            expect(
+              yield* manager.invokeCommand({ generation: listed.generation, id: healthyCommandId }),
+            ).toEqual({ message: "still healthy", tone: "success" });
+          }),
+          { entryPointTimeout: "50 millis" },
+        );
+      }).pipe(Effect.provide(NodeServices.layer)),
+    );
+  }
+
+  for (const { outcome, handler } of failureCases) {
+    it.live(`retires the plugin whose command ${outcome} and keeps the reason`, () =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3code-plugin-command-failure-test-",
+        });
+        const disposalFile = `${baseDir}/disposed.log`;
+        yield* writePackage(
+          baseDir,
+          packageId,
+          commandId,
+          commandPluginSource(handler, disposalFile),
+        );
+        yield* writePackage(baseDir, healthyPackageId, healthyCommandId, healthySource);
+
+        yield* useEnvironment(
+          baseDir,
+          Effect.gen(function* () {
+            const manager = yield* PluginPackageManager.PluginPackageManager;
+            const catalog = yield* PluginCommandCatalog.PluginCommandCatalog;
+            yield* manager.enable(healthyPackageId);
+            yield* manager.enable(packageId);
+            const listed = yield* catalog.list;
+
+            const failure = yield* Effect.flip(
+              manager.invokeCommand({ generation: listed.generation, id: commandId }),
+            );
+            const reason = `command ${commandId} ${outcome}: ${expectedMessage(outcome)}`;
+            expect(failure._tag).toBe("PluginCommandInvocationError");
+            const encoded = encodeInvocationError(failure);
+            expect(encoded).toContain(reason);
+            expect(encoded).not.toContain("index.mjs");
+
+            expect((yield* manager.status).packages).toMatchObject([
+              { id: healthyPackageId, state: "active" },
+              { id: packageId, enabled: true, state: "error", error: reason },
+            ]);
+            expect(yield* fileSystem.readFileString(disposalFile)).toBe("disposed\n");
+            const afterFailure = yield* catalog.list;
+            expect(afterFailure.commands.map((command) => command.id)).toEqual(
+              expect.arrayContaining([healthyCommandId]),
+            );
+            expect(afterFailure.commands.map((command) => command.id)).not.toContain(commandId);
+            expect(
+              yield* manager.invokeCommand({
+                generation: afterFailure.generation,
+                id: healthyCommandId,
+              }),
+            ).toEqual({ message: "still healthy", tone: "success" });
+
+            expect((yield* manager.reload(packageId)).packages).toMatchObject([
+              { id: healthyPackageId, state: "active" },
+              { id: packageId, state: "active" },
+            ]);
+          }),
+          { entryPointTimeout: "50 millis" },
+        );
+      }).pipe(Effect.provide(NodeServices.layer)),
+    );
+  }
 });

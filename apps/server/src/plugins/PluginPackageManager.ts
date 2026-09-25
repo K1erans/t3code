@@ -2,6 +2,7 @@ import * as NodeURL from "node:url";
 
 import {
   PluginCommandInvocationResult,
+  type PluginCommandInvokeInput,
   PluginPackageNotFoundError,
   PluginPackageOperationError,
   type PluginPackageDiscoveryError,
@@ -16,6 +17,7 @@ import {
 } from "@t3tools/plugin-runtime/manifest";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -29,6 +31,7 @@ import * as PluginCommandCatalog from "./PluginCommandCatalog.ts";
 
 const MANIFEST_FILE_NAME = "t3-plugin.json";
 const COMMAND_CAPABILITY = "t3.commands@1";
+const MAX_REASON_LENGTH = 2_000;
 
 interface DiscoveredPackage {
   readonly directory: string;
@@ -61,11 +64,48 @@ export interface PluginPackageApi {
 
 type PluginPackageActivator = (api: PluginPackageApi) => void | Promise<void>;
 
+/** Why a plugin entry point failed. Carries only the readable reason, never the stack. */
+export class PluginEntryPointError extends Schema.TaggedError<PluginEntryPointError>()(
+  "PluginEntryPointError",
+  { reason: Schema.String },
+) {
+  override get message(): string {
+    return this.reason;
+  }
+}
+
+type EntryPointOutcome = "threw" | "rejected" | "timed out";
+
+/** Runs one call into plugin code, turning a throw, rejection or timeout into a reason. */
+type EntryPointGuard = <A>(
+  entryPoint: string,
+  invoke: () => A | PromiseLike<A>,
+) => Effect.Effect<A, PluginEntryPointError>;
+
+export interface PluginPackageManagerOptions {
+  /** How long an async entry point may run before the plugin is marked failed. */
+  readonly entryPointTimeout?: Duration.Input;
+}
+
+const isPromiseLike = (value: unknown): value is PromiseLike<unknown> =>
+  (typeof value === "object" || typeof value === "function") &&
+  value !== null &&
+  typeof (value as { then?: unknown }).then === "function";
+
+const failureReason = (entryPoint: string, outcome: EntryPointOutcome, error: unknown): string => {
+  const message = (error instanceof Error ? error.message : String(error)).trim();
+  return `${entryPoint} ${outcome}: ${message.length === 0 ? "unknown error" : message}`
+    .slice(0, MAX_REASON_LENGTH)
+    .trim();
+};
+
 const decodeManifestJson = Schema.decodeUnknownEffect(Schema.fromJsonString(PluginManifest));
 const decodeInvocationResult = Schema.decodeUnknownEffect(PluginCommandInvocationResult);
 const isPluginPackageOperationError = Schema.is(PluginPackageOperationError);
+const isPluginEntryPointError = Schema.is(PluginEntryPointError);
 
 const detailFromUnknown = (error: unknown): string => {
+  if (isPluginEntryPointError(error)) return error.reason;
   if (isPluginPackageOperationError(error)) {
     if (error.detail !== undefined) return error.detail;
     if (error.cause !== undefined) return detailFromUnknown(error.cause);
@@ -95,11 +135,17 @@ const operationError = (
   });
 };
 
+interface DefinitionHooks {
+  readonly guard: EntryPointGuard;
+  readonly run: <A>(effect: Effect.Effect<A, PluginEntryPointError>) => Promise<A>;
+  readonly onCommandFailed: () => void;
+  readonly onRetired: () => void;
+}
+
 const makeDefinition = (
   discovered: DiscoveredPackage,
   activatePackage: PluginPackageActivator,
-  onRetired: () => void,
-  onCleanupError: (error: unknown) => void,
+  { guard, run, onCommandFailed, onRetired }: DefinitionHooks,
 ): PluginDefinition => {
   const declaredCommands = new Set(discovered.manifest.contributes?.commands ?? []);
 
@@ -110,14 +156,7 @@ const makeDefinition = (
       context.onDispose(onRetired);
       const api: PluginPackageApi = {
         onDispose(cleanup) {
-          context.onDispose(async () => {
-            try {
-              await cleanup();
-            } catch (error) {
-              onCleanupError(error);
-              throw error;
-            }
-          });
+          context.onDispose(() => run(guard("dispose", cleanup)));
         },
         registerCommand(command, handler) {
           if (!discovered.manifest.capabilities.includes(COMMAND_CAPABILITY)) {
@@ -128,11 +167,12 @@ const makeDefinition = (
           }
           PluginCommandCatalog.registerPluginCommand(context, {
             command,
-            handler: Effect.tryPromise({
-              try: async () => handler(),
-              catch: (cause) =>
-                new PluginCommandCatalog.PluginCommandExecutionError({ cause, id: command.id }),
-            }).pipe(
+            handler: guard(`command ${command.id}`, handler).pipe(
+              Effect.tapError(() => Effect.sync(onCommandFailed)),
+              Effect.mapError(
+                (cause) =>
+                  new PluginCommandCatalog.PluginCommandExecutionError({ cause, id: command.id }),
+              ),
               Effect.flatMap((result) =>
                 decodeInvocationResult(result).pipe(
                   Effect.mapError(
@@ -148,7 +188,7 @@ const makeDefinition = (
           });
         },
       };
-      return activatePackage(api);
+      return run(guard("activate", () => activatePackage(api)));
     },
   };
 };
@@ -157,6 +197,8 @@ export class PluginPackageManager extends Context.Service<
   PluginPackageManager,
   {
     readonly status: Effect.Effect<PluginPackageStatusSnapshot, PluginPackageOperationError>;
+    /** Invokes a catalog command, then retires any plugin whose command failed. */
+    readonly invokeCommand: PluginCommandCatalog.PluginCommandCatalog["Service"]["invoke"];
     readonly enable: (
       id: string,
     ) => Effect.Effect<
@@ -178,7 +220,9 @@ export class PluginPackageManager extends Context.Service<
   }
 >()("t3/plugins/PluginPackageManager") {}
 
-export const make = Effect.fn("PluginPackageManager.make")(function* () {
+export const make = Effect.fn("PluginPackageManager.make")(function* (
+  options: PluginPackageManagerOptions = {},
+) {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const config = yield* ServerConfig.ServerConfig;
@@ -192,7 +236,55 @@ export const make = Effect.fn("PluginPackageManager.make")(function* () {
   const activeManifests = new Map<string, PluginManifestType>();
   const activeRetirements = new Map<string, Promise<void>>();
   const packageErrors = new Map<string, string>();
+  const failedCommandPlugins = new Set<string>();
+  const entryPointTimeout = Duration.fromInputUnsafe(options.entryPointTimeout ?? "30 seconds");
+  const runEntryPoint = Effect.runPromiseWith(yield* Effect.context<never>());
   let loadSequence = 0;
+
+  // The one wrapper around every call into plugin code (activate, commands, dispose).
+  // The reason goes into the package status; the stack stays in the server log.
+  const guardEntryPoint =
+    (id: string): EntryPointGuard =>
+    (entryPoint, invoke) => {
+      const fail = (outcome: EntryPointOutcome, error: unknown) =>
+        Effect.gen(function* () {
+          const reason = failureReason(entryPoint, outcome, error);
+          packageErrors.set(id, reason);
+          yield* Effect.logWarning("Local plugin package entry point failed", {
+            id,
+            reason,
+            ...(error instanceof Error && error.stack !== undefined ? { stack: error.stack } : {}),
+          });
+          return yield* new PluginEntryPointError({ reason });
+        });
+      return Effect.suspend(() => {
+        let result: ReturnType<typeof invoke>;
+        try {
+          result = invoke();
+        } catch (error) {
+          return fail("threw", error);
+        }
+        if (!isPromiseLike(result)) return Effect.succeed(result);
+        const pending = result;
+        return Effect.promise(() =>
+          Promise.resolve(pending).then(
+            (value) => ({ settled: "fulfilled" as const, value }),
+            (error: unknown) => ({ settled: "rejected" as const, error }),
+          ),
+        ).pipe(
+          Effect.flatMap((outcome) =>
+            outcome.settled === "fulfilled"
+              ? Effect.succeed(outcome.value)
+              : fail("rejected", outcome.error),
+          ),
+          Effect.timeoutOrElse({
+            duration: entryPointTimeout,
+            orElse: () =>
+              fail("timed out", `did not finish within ${Duration.format(entryPointTimeout)}`),
+          }),
+        );
+      });
+    };
 
   const removeCacheDirectory = (directory: string) =>
     fileSystem
@@ -359,8 +451,11 @@ export const make = Effect.fn("PluginPackageManager.make")(function* () {
     });
     return {
       cacheDirectory,
-      definition: makeDefinition(discovered, loaded.value, markRetired, (error) => {
-        packageErrors.set(discovered.manifest.id, detailFromUnknown(error));
+      definition: makeDefinition(discovered, loaded.value, {
+        guard: guardEntryPoint(discovered.manifest.id),
+        run: runEntryPoint,
+        onCommandFailed: () => failedCommandPlugins.add(discovered.manifest.id),
+        onRetired: markRetired,
       }),
       retired,
     } satisfies LoadedDefinition;
@@ -451,6 +546,7 @@ export const make = Effect.fn("PluginPackageManager.make")(function* () {
             return yield* statusUnlocked(operation);
           }
           packageErrors.delete(id);
+          failedCommandPlugins.delete(id);
 
           const previousEnabledIds = new Set(enabledIds);
           const previousCacheDirectory = activeCacheDirectories.get(id);
@@ -528,6 +624,7 @@ export const make = Effect.fn("PluginPackageManager.make")(function* () {
           return yield* new PluginPackageNotFoundError({ id });
         }
         packageErrors.delete(id);
+        failedCommandPlugins.delete(id);
 
         const previousEnabledIds = new Set(enabledIds);
         enabledIds.delete(id);
@@ -574,6 +671,37 @@ export const make = Effect.fn("PluginPackageManager.make")(function* () {
         return yield* statusUnlocked("disable");
       }),
     ),
+  );
+
+  // A failed command leaves its package enabled but inactive, showing the reason until Reload.
+  const retireFailedCommandPlugins = Effect.uninterruptible(
+    Effect.gen(function* () {
+      for (const id of failedCommandPlugins) {
+        failedCommandPlugins.delete(id);
+        if (!activeDefinitions.has(id)) continue;
+        const previousCatalog = yield* catalog.list;
+        const reconciled = yield* Effect.exit(catalog.reconcile(definitionList([id, undefined])));
+        if (
+          reconciled._tag === "Failure" &&
+          (yield* catalog.list).generation === previousCatalog.generation
+        ) {
+          yield* Effect.logWarning("Failed to retire failed local plugin package", {
+            id,
+            error: detailFromCause(reconciled.cause),
+          });
+          continue;
+        }
+        const cacheDirectory = activeCacheDirectories.get(id);
+        const retirement = activeRetirements.get(id);
+        activeDefinitions.delete(id);
+        activeCacheDirectories.delete(id);
+        activeRetirements.delete(id);
+        if (cacheDirectory !== undefined) {
+          if (retirement !== undefined) yield* Effect.promise(() => retirement);
+          yield* removeCacheDirectory(cacheDirectory);
+        }
+      }
+    }),
   );
 
   yield* settings.start.pipe(Effect.mapError((error) => operationError("status", error)));
@@ -644,27 +772,49 @@ export const make = Effect.fn("PluginPackageManager.make")(function* () {
 
   return {
     status: semaphore.withPermits(1)(statusUnlocked("status")),
+    invokeCommand: (input: PluginCommandInvokeInput) =>
+      catalog
+        .invoke(input)
+        .pipe(
+          Effect.ensuring(
+            Effect.suspend(() =>
+              failedCommandPlugins.size === 0
+                ? Effect.void
+                : semaphore.withPermits(1)(retireFailedCommandPlugins),
+            ),
+          ),
+        ),
     enable: (id: string) => semaphore.withPermits(1)(transition("enable", id)),
     disable: (id: string) => semaphore.withPermits(1)(disableUnlocked(id)),
     reload: (id: string) => semaphore.withPermits(1)(transition("reload", id)),
   } as const;
 });
 
-const unavailableService = (error: PluginPackageOperationError) =>
+const unavailableService = (
+  error: PluginPackageOperationError,
+  catalog: PluginCommandCatalog.PluginCommandCatalog["Service"],
+) =>
   PluginPackageManager.of({
     status: Effect.fail(error),
+    invokeCommand: catalog.invoke,
     enable: () => Effect.fail(error),
     disable: () => Effect.fail(error),
     reload: () => Effect.fail(error),
   });
 
-export const layer = Layer.effect(
-  PluginPackageManager,
-  make().pipe(
-    Effect.catch((error) =>
-      Effect.logWarning("Local plugin package manager failed to start", {
-        error: detailFromUnknown(error),
-      }).pipe(Effect.as(unavailableService(error))),
+export const layerWith = (options: PluginPackageManagerOptions = {}) =>
+  Layer.effect(
+    PluginPackageManager,
+    make(options).pipe(
+      Effect.catch((error) =>
+        Effect.gen(function* () {
+          yield* Effect.logWarning("Local plugin package manager failed to start", {
+            error: detailFromUnknown(error),
+          });
+          return unavailableService(error, yield* PluginCommandCatalog.PluginCommandCatalog);
+        }),
+      ),
     ),
-  ),
-);
+  );
+
+export const layer = layerWith();
