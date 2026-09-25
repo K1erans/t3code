@@ -1641,6 +1641,52 @@ export default async function activate(api) {
     }),
   );
 
+  it.effect("re-establishes a silently lost watch when the parent reports plugins/", () =>
+    Effect.gen(function* () {
+      const parentEvents = yield* Queue.unbounded<string>();
+      const subscriptions = yield* Queue.unbounded<number>();
+      const rescans = yield* Queue.unbounded<number>();
+      let subscribed = 0;
+      let rescanned = 0;
+      let replaced = false;
+      // The plugins/ watch itself never reports anything, as when it stays attached
+      // to a deleted folder; only the parent directory sees the change.
+      const watch = Stream.unwrap(
+        Effect.suspend(() => Queue.offer(subscriptions, ++subscribed)).pipe(
+          Effect.as(
+            PluginPackageManager.untilPluginsDirectoryReplaced(
+              Stream.never,
+              Stream.fromQueue(parentEvents),
+              Effect.sync(() => replaced),
+            ),
+          ),
+        ),
+      );
+      yield* PluginPackageManager.watchPluginsDirectory(
+        watch,
+        Effect.sync(() => {
+          replaced = false;
+        }),
+        Effect.suspend(() => Queue.offer(rescans, ++rescanned)),
+      ).pipe(Effect.forkScoped);
+      expect(yield* Queue.take(subscriptions)).toBe(1);
+
+      // A parent event for an unchanged plugins/ is an ordinary change.
+      yield* Queue.offer(parentEvents, "plugins");
+      yield* Effect.yieldNow;
+      yield* TestClock.adjust(PluginPackageManager.WATCH_DEBOUNCE);
+      expect(yield* Queue.take(rescans)).toBe(1);
+      expect(yield* Queue.size(subscriptions)).toBe(0);
+
+      // Once plugins/ was replaced, the next parent event re-establishes the watch.
+      replaced = true;
+      yield* Queue.offer(parentEvents, "plugins");
+      expect(yield* Queue.take(subscriptions)).toBe(2);
+      yield* TestClock.adjust(PluginPackageManager.WATCH_DEBOUNCE);
+      expect(yield* Queue.take(rescans)).toBe(2);
+    }),
+  );
+
   it.effect("restarts the backoff after a watch that stayed up", () =>
     Effect.gen(function* () {
       const healthy = yield* Queue.unbounded<string, string>();

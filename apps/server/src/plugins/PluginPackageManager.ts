@@ -1043,7 +1043,7 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
     );
   yield* Deferred.await(startupLocked);
   yield* watchPluginsDirectory(
-    watchEvents(fileSystem, pluginsDirectory),
+    watchEvents(fileSystem, path, pluginsDirectory),
     fileSystem.makeDirectory(pluginsDirectory, { recursive: true }),
     rescan,
   ).pipe(Effect.forkScoped);
@@ -1072,22 +1072,36 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
 });
 
 /**
- * Top-level events in `plugins/`. Deleting the folder can leave the watch
- * attached to the removed folder without an error, so the stream ends as soon
- * as `plugins/` is no longer the folder it started on.
+ * `events` from `plugins/`, merged with `parentEvents` for the `plugins` entry of
+ * its parent, until `replaced` reports that `plugins/` is no longer the folder the
+ * watch started on. Deleting the folder can leave its watch attached to the
+ * removed folder without an error or an event; the parent still reports it.
  */
-const watchEvents = (fileSystem: FileSystem.FileSystem, directory: string) =>
+export const untilPluginsDirectoryReplaced = <E, R>(
+  events: Stream.Stream<unknown, E, R>,
+  parentEvents: Stream.Stream<unknown, E, R>,
+  replaced: Effect.Effect<boolean>,
+) => Stream.merge(events, parentEvents).pipe(Stream.takeUntilEffect(() => replaced));
+
+/** Top-level events in `plugins/`, ending once the folder is deleted or replaced. */
+const watchEvents = (fileSystem: FileSystem.FileSystem, path: Path.Path, directory: string) =>
   Stream.unwrap(
     fileSystem.stat(directory).pipe(
-      Effect.map((watched) => {
-        const replaced = fileSystem.stat(directory).pipe(
-          Effect.map(
-            (info) => Option.getOrUndefined(info.ino) !== Option.getOrUndefined(watched.ino),
+      Effect.map((watched) =>
+        untilPluginsDirectoryReplaced(
+          fileSystem.watch(directory),
+          // Non-recursive, and only the `plugins` entry: the parent is the busy state directory.
+          fileSystem
+            .watch(path.dirname(directory))
+            .pipe(Stream.filter((event) => path.basename(event.path) === path.basename(directory))),
+          fileSystem.stat(directory).pipe(
+            Effect.map(
+              (info) => Option.getOrUndefined(info.ino) !== Option.getOrUndefined(watched.ino),
+            ),
+            Effect.orElseSucceed(() => true),
           ),
-          Effect.orElseSucceed(() => true),
-        );
-        return fileSystem.watch(directory).pipe(Stream.takeUntilEffect(() => replaced));
-      }),
+        ),
+      ),
     ),
   );
 
