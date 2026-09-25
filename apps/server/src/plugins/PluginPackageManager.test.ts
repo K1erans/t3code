@@ -1377,6 +1377,117 @@ it.layer(NodeServices.layer)("plugin package pickup", (it) => {
     }),
   );
 
+  it.effect("clears a failed update's error once the folder is back to the live version", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3code-plugin-package-restore-test-",
+      });
+      const packageDirectory = yield* writePackage(
+        baseDir,
+        packageId,
+        commandId,
+        pluginSourceWithHelper,
+      );
+      const liveTime = 1_767_225_600;
+      // Edits in place with explicit mtimes, so restoring the file restores the fingerprint.
+      const writeMessage = Effect.fn(function* (source: string, time: number) {
+        yield* fileSystem.writeFileString(`${packageDirectory}/message.mjs`, source);
+        yield* fileSystem.utimes(`${packageDirectory}/message.mjs`, time, time);
+      });
+      const liveSource = 'export const message = "live";\n';
+      yield* writeMessage(liveSource, liveTime);
+
+      yield* useEnvironment(
+        baseDir,
+        Effect.gen(function* () {
+          const manager = yield* PluginPackageManager.PluginPackageManager;
+          const catalog = yield* PluginCommandCatalog.PluginCommandCatalog;
+          const invoke = Effect.gen(function* () {
+            const listed = yield* catalog.list;
+            return yield* catalog.invoke({ generation: listed.generation, id: commandId });
+          });
+          yield* manager.enable(packageId);
+
+          yield* writeMessage('throw new Error("broken update");\n', liveTime + 60);
+          expect((yield* manager.rescan).packages).toMatchObject([
+            { id: packageId, state: "error" },
+          ]);
+          expect(yield* invoke).toMatchObject({ message: "live" });
+
+          yield* writeMessage(liveSource, liveTime);
+          const restored = yield* manager.rescan;
+          expect(restored.packages).toMatchObject([{ id: packageId, state: "active" }]);
+          expect(restored.packages[0]?.error).toBeUndefined();
+          expect(yield* invoke).toMatchObject({ message: "live" });
+        }),
+      );
+    }),
+  );
+
+  it.effect("does not record an interrupted reload as a failed load", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3code-plugin-package-interrupted-reload-test-",
+      });
+      const gateSymbol = `t3.test.plugin.interrupted-reload.${baseDir}`;
+      const { gate, started } = yield* makeGate(gateSymbol);
+      const packageDirectory = yield* writePackage(
+        baseDir,
+        packageId,
+        commandId,
+        commandPluginSource(
+          '() => ({ message: "one", tone: "success" })',
+          `${baseDir}/disposed.log`,
+        ),
+      );
+
+      yield* useEnvironment(
+        baseDir,
+        Effect.gen(function* () {
+          const manager = yield* PluginPackageManager.PluginPackageManager;
+          const catalog = yield* PluginCommandCatalog.PluginCommandCatalog;
+          const invoke = Effect.gen(function* () {
+            const listed = yield* catalog.list;
+            return yield* catalog.invoke({ generation: listed.generation, id: commandId });
+          });
+          yield* manager.enable(packageId);
+
+          // The first activation of the update blocks until the reload is interrupted.
+          yield* fileSystem.writeFileString(
+            `${packageDirectory}/index.mjs`,
+            `const gate = globalThis[Symbol.for(${encodeJsonString(gateSymbol)})];
+export default async function activate(api) {
+  if (gate.calls++ === 0) {
+    gate.started();
+    await new Promise(() => {});
+  }
+  api.registerCommand(
+    { id: "${commandId}", surfaces: ["web", "desktop", "mobile"] },
+    () => ({ message: "two", tone: "success" })
+  );
+}
+`,
+          );
+          const reloading = yield* Effect.forkChild(manager.reload(packageId));
+          yield* Effect.promise(() => started);
+          yield* Fiber.interrupt(reloading);
+
+          const status = yield* manager.status;
+          expect(status.packages).toMatchObject([{ id: packageId, state: "active" }]);
+          expect(status.packages[0]?.error).toBeUndefined();
+          expect(yield* invoke).toMatchObject({ message: "one" });
+
+          // A rescan still picks up the changed folder.
+          yield* manager.rescan;
+          expect(gate.calls).toBe(2);
+          expect(yield* invoke).toMatchObject({ message: "two" });
+        }),
+      );
+    }),
+  );
+
   it.effect("rescans once per debounced burst of folder events", () =>
     Effect.gen(function* () {
       const events = yield* Queue.unbounded<string>();

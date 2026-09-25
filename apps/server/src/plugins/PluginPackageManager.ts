@@ -845,8 +845,11 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
 
           let attempted = INVALID_PACKAGE_TREE;
           const failLoad = (cause: Cause.Cause<PluginPackageOperationError>) => {
-            packageErrors.set(id, { reason: detailFromCause(cause) });
-            failedFingerprints.set(id, attempted);
+            // An interrupted action (say, its client disconnected) says nothing about the package.
+            if (!Cause.hasInterruptsOnly(cause)) {
+              packageErrors.set(id, { reason: detailFromCause(cause) });
+              failedFingerprints.set(id, attempted);
+            }
             return Effect.failCause(cause);
           };
           const tree = yield* Effect.exit(restore(validatePackageTree(pluginPackage, operation)));
@@ -945,8 +948,14 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
         continue;
       }
       const current = yield* fingerprint(pluginPackage);
-      if (current === active.get(id)?.fingerprint || current === failedFingerprints.get(id))
+      if (current === active.get(id)?.fingerprint) {
+        // The folder is back to the live version, so a failed load of another version
+        // no longer applies. Errors of the live version itself stay.
+        if (packageErrors.get(id)?.source === undefined) packageErrors.delete(id);
+        failedFingerprints.delete(id);
         continue;
+      }
+      if (current === failedFingerprints.get(id)) continue;
       // A failed load is recorded against the package and shown in status.
       const reloaded = yield* Effect.exit(transition("reload", id));
       if (reloaded._tag === "Failure") {
