@@ -21,6 +21,7 @@ import * as PluginPackageManager from "./PluginPackageManager.ts";
 
 const packageId = "com.acme.runtime-status";
 const commandId = "acme.runtime-status";
+const countCommandId = "acme.count-invocations";
 
 const manifest = {
   manifestVersion: 1,
@@ -28,8 +29,8 @@ const manifest = {
   version: "1.0.0",
   apiVersion: 1,
   entrypoints: { server: "./index.mjs" },
-  capabilities: ["t3.commands@1"],
-  contributes: { commands: [commandId] },
+  capabilities: ["t3.commands@1", "t3.storage@0"],
+  contributes: { commands: [commandId, countCommandId] },
 } as const;
 
 const encodeManifest = Schema.encodeSync(Schema.fromJsonString(PluginManifest));
@@ -52,6 +53,17 @@ export default function activate(api) {
       surfaces: ["web", "desktop", "mobile"]
     },
     () => ({ message: ${encodeJsonString(message)}, tone: "success" })
+  );
+  api.registerCommand(
+    {
+      id: "${countCommandId}",
+      label: "Count invocations",
+      surfaces: ["web", "desktop", "mobile"]
+    },
+    async () => {
+      const count = await api.storage.update("invocations", (current) => (current ?? 0) + 1);
+      return { message: "Invoked " + count + " times.", tone: "success" };
+    }
   );
   api.onDispose(() => appendFile(${encodeJsonString(disposalFile)}, "disposed\\n"));
 }
@@ -302,6 +314,53 @@ it.layer(NodeServices.layer)("plugin package lifecycle", (it) => {
       expect(yield* fileSystem.readFileString(`${packageDirectory}/disposed.log`)).toBe(
         "disposed\ndisposed\n",
       );
+    }),
+  );
+
+  it.effect("keeps plugin storage across reload, disable, and restart", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3code-plugin-package-storage-test-",
+      });
+      const packageDirectory = `${baseDir}/userdata/plugins/${packageId}`;
+      const dataDirectory = `${baseDir}/userdata/plugin-data/${packageId}`;
+      yield* fileSystem.makeDirectory(packageDirectory, { recursive: true });
+      yield* fileSystem.writeFileString(
+        `${packageDirectory}/t3-plugin.json`,
+        encodeManifest(manifest),
+      );
+      yield* fileSystem.writeFileString(
+        `${packageDirectory}/index.mjs`,
+        pluginSource(`${packageDirectory}/disposed.log`),
+      );
+
+      const count = Effect.gen(function* () {
+        const catalog = yield* PluginCommandCatalog.PluginCommandCatalog;
+        const listed = yield* catalog.list;
+        return (yield* catalog.invoke({ generation: listed.generation, id: countCommandId }))
+          .message;
+      });
+
+      yield* useEnvironment(
+        baseDir,
+        Effect.gen(function* () {
+          const manager = yield* PluginPackageManager.PluginPackageManager;
+          yield* manager.enable(packageId);
+          expect(yield* count).toBe("Invoked 1 times.");
+          expect(yield* count).toBe("Invoked 2 times.");
+          yield* manager.reload(packageId);
+          expect(yield* count).toBe("Invoked 3 times.");
+          yield* manager.disable(packageId);
+          expect(yield* fileSystem.exists(`${dataDirectory}/storage.sqlite`)).toBe(true);
+          yield* manager.enable(packageId);
+          expect(yield* count).toBe("Invoked 4 times.");
+        }),
+      );
+
+      expect(yield* useEnvironment(baseDir, count)).toBe("Invoked 5 times.");
+      expect(yield* fileSystem.exists(`${dataDirectory}/storage.sqlite`)).toBe(true);
+      expect(yield* fileSystem.exists(`${baseDir}/userdata/state.sqlite`)).toBe(false);
     }),
   );
 

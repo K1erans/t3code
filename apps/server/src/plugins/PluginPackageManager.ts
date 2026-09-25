@@ -23,15 +23,18 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
+import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 
 import * as ServerConfig from "../config.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as PluginCommandCatalog from "./PluginCommandCatalog.ts";
+import * as PluginStorage from "./PluginStorage.ts";
 
 const MANIFEST_FILE_NAME = "t3-plugin.json";
 const COMMAND_CAPABILITY = "t3.commands@1";
 const MAX_REASON_LENGTH = 2_000;
+const STORAGE_CAPABILITY = "t3.storage@0";
 
 interface DiscoveredPackage {
   readonly directory: string;
@@ -49,7 +52,15 @@ interface LoadedDefinition {
   readonly retired: Promise<void>;
 }
 
+interface PluginDataAccess {
+  readonly dataDir: string;
+  readonly storage: PluginStorage.PluginStorage;
+}
+
 export interface PluginPackageApi {
+  /** `<stateDir>/plugin-data/<pluginId>/`, present when the manifest declares `t3.storage@0`. */
+  readonly dataDir?: string;
+  readonly storage?: PluginStorage.PluginStorage;
   readonly onDispose: (cleanup: () => void | Promise<void>) => void;
   readonly registerCommand: (
     command: {
@@ -145,6 +156,7 @@ interface DefinitionHooks {
 const makeDefinition = (
   discovered: DiscoveredPackage,
   activatePackage: PluginPackageActivator,
+  data: PluginDataAccess | undefined,
   { guard, run, onCommandFailed, onRetired }: DefinitionHooks,
 ): PluginDefinition => {
   const declaredCommands = new Set(discovered.manifest.contributes?.commands ?? []);
@@ -155,6 +167,7 @@ const makeDefinition = (
     activate(context: PluginActivationContext) {
       context.onDispose(onRetired);
       const api: PluginPackageApi = {
+        ...data,
         onDispose(cleanup) {
           context.onDispose(() => run(guard("dispose", cleanup)));
         },
@@ -231,6 +244,13 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
   const semaphore = yield* Semaphore.make(1);
   const pluginsDirectory = path.join(config.stateDir, "plugins");
   const pluginCacheDirectory = path.join(config.stateDir, "plugin-cache");
+  // Plugin data outlives disable, reload and restarts; nothing here ever deletes it.
+  const pluginDataDirectory = path.join(config.stateDir, "plugin-data");
+  // Created before the shutdown finalizer below, so stores close after plugins retire.
+  const storageScope = yield* Scope.make();
+  yield* Effect.addFinalizer((exit) => Scope.close(storageScope, exit));
+  // One store per plugin id, shared across reloads so update serialization spans generations.
+  const openStores = new Map<string, PluginDataAccess>();
   const activeDefinitions = new Map<string, PluginDefinition>();
   const activeCacheDirectories = new Map<string, string>();
   const activeManifests = new Map<string, PluginManifestType>();
@@ -294,6 +314,24 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
           Effect.logWarning("Failed to remove local plugin package cache", { directory, error }),
         ),
       );
+
+  const dataAccessFor = Effect.fn("PluginPackageManager.dataAccessFor")(function* (
+    id: string,
+    operation: PluginPackageOperation,
+  ) {
+    const existing = openStores.get(id);
+    if (existing !== undefined) return existing;
+    const dataDir = path.join(pluginDataDirectory, id);
+    const storage = yield* PluginStorage.open(dataDir).pipe(
+      Scope.provide(storageScope),
+      Effect.provideService(FileSystem.FileSystem, fileSystem),
+      Effect.provideService(Path.Path, path),
+      Effect.mapError((error) => operationError(operation, error, id)),
+    );
+    const access = { dataDir, storage } satisfies PluginDataAccess;
+    openStores.set(id, access);
+    return access;
+  });
 
   const validatePackageTree = Effect.fn("PluginPackageManager.validatePackageTree")(function* (
     discovered: DiscoveredPackage,
@@ -390,6 +428,9 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
       );
     }
     yield* validatePackageTree(discovered, operation);
+    const data = discovered.manifest.capabilities.includes(STORAGE_CAPABILITY)
+      ? yield* dataAccessFor(discovered.manifest.id, operation)
+      : undefined;
     const sourceEntrypointPath = path.resolve(discovered.directory, serverEntrypoint);
     const relativeEntrypoint = path.relative(discovered.directory, sourceEntrypointPath);
     if (
@@ -451,7 +492,7 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
     });
     return {
       cacheDirectory,
-      definition: makeDefinition(discovered, loaded.value, {
+      definition: makeDefinition(discovered, loaded.value, data, {
         guard: guardEntryPoint(discovered.manifest.id),
         run: runEntryPoint,
         onCommandFailed: () => failedCommandPlugins.add(discovered.manifest.id),

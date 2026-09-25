@@ -55,6 +55,10 @@ describe("PluginManifest", () => {
       "1.2.3+build.7",
     );
     expect(() => decodeManifest({ ...validManifest, requires: ["t3.commands"] })).toThrow();
+    expect(() => decodeManifest({ ...validManifest, requires: ["t3.storage@00"] })).toThrow();
+    expect(decodeManifest({ ...validManifest, requires: ["t3.storage@0"] }).requires).toEqual([
+      "t3.storage@0",
+    ]);
   });
 
   it("rejects entrypoints that escape the plugin directory", () => {
