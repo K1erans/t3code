@@ -19,6 +19,7 @@ describe("plugin package contracts", () => {
         packages: [
           {
             id: "com.acme.runtime-status",
+            name: "Runtime status",
             version: "1.0.0",
             apiVersion: 1,
             enabled: true,
@@ -33,6 +34,7 @@ describe("plugin package contracts", () => {
       packages: [
         {
           id: "com.acme.runtime-status",
+          name: "Runtime status",
           version: "1.0.0",
           apiVersion: 1,
           enabled: true,

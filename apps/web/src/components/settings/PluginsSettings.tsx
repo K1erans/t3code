@@ -6,15 +6,15 @@ import {
 import {
   CircleAlertIcon,
   FolderCodeIcon,
+  PackageIcon,
   RefreshCwIcon,
   RotateCwIcon,
+  SearchIcon,
   ShieldAlertIcon,
 } from "lucide-react";
 import { useCallback, useMemo, useState } from "react";
 
-import { isElectron } from "../../env";
-import { usePrimarySessionState } from "../../environments/primary";
-import { usePrimaryEnvironmentId } from "../../state/environments";
+import type { EnvironmentPresentation } from "../../state/environments";
 import { useEnvironmentQuery } from "../../state/query";
 import { serverEnvironment } from "../../state/server";
 import { useAtomCommand } from "../../state/use-atom-command";
@@ -22,19 +22,17 @@ import { Alert, AlertDescription, AlertTitle } from "../ui/alert";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "../ui/empty";
+import { InputGroup, InputGroupAddon, InputGroupInput } from "../ui/input-group";
 import { Spinner } from "../ui/spinner";
 import { Switch } from "../ui/switch";
 import { toastManager } from "../ui/toast";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
+import { useEnvironmentOperateAccess } from "./EnvironmentIconPicker";
+import { filterPluginPackages, pluginStatusBadges } from "./PluginsSettings.logic";
+import { useSettingsScope } from "./SettingsScopeContext";
+import { SettingsScopeNotice } from "./SettingsScopeNotice";
 import { SettingsPageContainer, SettingsRow, SettingsSection } from "./settingsLayout";
-import { resolvePrimaryOperateAccess } from "./ProviderSettingsPanel.logic";
 import { searchableSetting } from "./settingsSearch";
-
-const statePresentation = {
-  active: { label: "Active", variant: "success" },
-  disabled: { label: "Disabled", variant: "secondary" },
-  error: { label: "Error", variant: "error" },
-} as const;
 
 type PackageAction = "enable" | "disable" | "reload";
 
@@ -56,16 +54,12 @@ function PluginPackageRow({
   readonly onEnabledChange: (enabled: boolean) => void;
   readonly onReload: () => void;
 }) {
-  const state = statePresentation[pluginPackage.state];
-  const commands = pluginPackage.contributions.commands;
   const busy = pendingAction !== null;
   const status = (
     <div className="flex flex-wrap items-center gap-1.5">
-      <Badge variant={state.variant}>{state.label}</Badge>
-      <Badge variant="outline">v{pluginPackage.version}</Badge>
-      {pluginPackage.capabilities.map((capability) => (
-        <Badge key={capability} variant="info">
-          {capability}
+      {pluginStatusBadges(pluginPackage).map((badge) => (
+        <Badge key={badge.label} variant={badge.variant}>
+          {badge.label}
         </Badge>
       ))}
     </div>
@@ -73,11 +67,25 @@ function PluginPackageRow({
 
   return (
     <SettingsRow
-      title={<code className="text-[13px]">{pluginPackage.id}</code>}
+      title={
+        <span className="flex min-w-0 items-center gap-2">
+          {pluginPackage.iconUrl ? (
+            <img src={pluginPackage.iconUrl} alt="" className="size-4 shrink-0" />
+          ) : (
+            <PackageIcon aria-hidden className="size-4 shrink-0 text-muted-foreground" />
+          )}
+          <span className="min-w-0 truncate">{pluginPackage.name}</span>
+        </span>
+      }
       description={
-        commands.length === 0
-          ? "No command contributions"
-          : `${commands.length} command${commands.length === 1 ? "" : "s"}: ${commands.join(", ")}`
+        <>
+          {pluginPackage.description ? (
+            <span className="block">{pluginPackage.description}</span>
+          ) : null}
+          <span className="block font-mono text-xs">
+            {pluginPackage.id} · v{pluginPackage.version}
+          </span>
+        </>
       }
       status={status}
       className="border border-border/60 bg-card/35"
@@ -88,7 +96,7 @@ function PluginPackageRow({
               type="button"
               size="icon-sm"
               variant="ghost-muted"
-              aria-label={`Reload ${pluginPackage.id}`}
+              aria-label={`Reload ${pluginPackage.name}`}
               disabled={busy || readOnly}
               onClick={onReload}
             >
@@ -102,7 +110,7 @@ function PluginPackageRow({
           <Switch
             checked={pluginPackage.enabled}
             disabled={busy || readOnly}
-            aria-label={`${pluginPackage.enabled ? "Disable" : "Enable"} ${pluginPackage.id}`}
+            aria-label={`${pluginPackage.enabled ? "Disable" : "Enable"} ${pluginPackage.name}`}
             onCheckedChange={onEnabledChange}
           />
         </div>
@@ -118,19 +126,41 @@ function PluginPackageRow({
   );
 }
 
+/**
+ * Plugins installed on the environment picked in the settings scope. Install
+ * and enable state live on that environment, so every client sees the same list.
+ */
 export function PluginsSettingsPanel() {
-  const environmentId = usePrimaryEnvironmentId();
-  const primarySession = usePrimarySessionState();
-  const operateAccess = resolvePrimaryOperateAccess({
-    isPrimary: true,
-    hasDesktopBridge: isElectron,
-    session: primarySession.data,
-    isPending: primarySession.isPending,
-    hasError: primarySession.error !== null,
-  });
+  const { environment, connectedEnvironments, scope } = useSettingsScope();
+  if (environment === null) {
+    return (
+      <SettingsScopeNotice target="environment">
+        Connect an environment to manage its plugins.
+      </SettingsScopeNotice>
+    );
+  }
+  return (
+    <EnvironmentPluginsSettings
+      key={environment.environmentId}
+      environment={environment}
+      // With several environments selected, name the one shown rather than imply all of them.
+      showEnvironmentHint={scope.kind !== "environment" && connectedEnvironments.length > 1}
+    />
+  );
+}
+
+function EnvironmentPluginsSettings({
+  environment,
+  showEnvironmentHint,
+}: {
+  readonly environment: EnvironmentPresentation;
+  readonly showEnvironmentHint: boolean;
+}) {
+  const environmentId = environment.environmentId;
+  const operateAccess = useEnvironmentOperateAccess(environmentId);
   const readOnly = operateAccess !== "granted";
   const status = useEnvironmentQuery(
-    environmentId === null ? null : serverEnvironment.pluginPackages({ environmentId, input: {} }),
+    serverEnvironment.pluginPackages({ environmentId, input: {} }),
   );
   const enablePlugin = useAtomCommand(serverEnvironment.enablePluginPackage, {
     reportFailure: false,
@@ -149,14 +179,20 @@ export function PluginsSettingsPanel() {
     readonly id: string;
     readonly action: PackageAction;
   } | null>(null);
+  const [query, setQuery] = useState("");
   const packages = useMemo(
-    () => [...(status.data?.packages ?? [])].sort((left, right) => left.id.localeCompare(right.id)),
+    () =>
+      [...(status.data?.packages ?? [])].sort(
+        (left, right) => left.name.localeCompare(right.name) || left.id.localeCompare(right.id),
+      ),
     [status.data?.packages],
   );
+  const visiblePackages = useMemo(() => filterPluginPackages(packages, query), [packages, query]);
+  const discoveryErrors = status.data?.errors ?? [];
 
   const runAction = useCallback(
     (pluginPackage: PluginPackageStatus, action: PackageAction) => {
-      if (environmentId === null || pending !== null || readOnly) return;
+      if (pending !== null || readOnly) return;
       setPending({ id: pluginPackage.id, action });
       const command =
         action === "enable" ? enablePlugin : action === "disable" ? disablePlugin : reloadPlugin;
@@ -174,7 +210,7 @@ export function PluginsSettingsPanel() {
           const error = squashAtomCommandFailure(result);
           toastManager.add({
             type: "error",
-            title: `Could not ${action} plugin`,
+            title: `Could not ${action} ${pluginPackage.name}`,
             description: actionFailureMessage(action, error),
           });
         }
@@ -186,7 +222,7 @@ export function PluginsSettingsPanel() {
   // Rescan reloads changed plugins, which needs operate access; a read-only
   // session still re-reads the status, which re-discovers the folder.
   const rescan = useCallback(() => {
-    if (environmentId === null || rescanning) return;
+    if (rescanning) return;
     if (readOnly) {
       status.refresh();
       return;
@@ -216,7 +252,7 @@ export function PluginsSettingsPanel() {
         {...searchableSetting("plugins")}
         headerAction={
           <div className="flex items-center gap-2">
-            <span className="text-[11px] text-muted-foreground">{countLabel}</span>
+            <span className="text-2xs text-muted-foreground">{countLabel}</span>
             <Tooltip>
               <TooltipTrigger
                 render={
@@ -241,6 +277,12 @@ export function PluginsSettingsPanel() {
           </div>
         }
       >
+        {showEnvironmentHint ? (
+          <p className="mb-3 text-sm text-muted-foreground">
+            Showing plugins on {environment.label}. Choose an environment above to manage another.
+          </p>
+        ) : null}
+
         <Alert variant="warning" className="mb-3">
           <ShieldAlertIcon />
           <AlertTitle>Trusted local code</AlertTitle>
@@ -251,7 +293,7 @@ export function PluginsSettingsPanel() {
         </Alert>
 
         {operateAccess === "denied" ? (
-          <Alert variant="info" className="mb-3" data-plugin-read-only>
+          <Alert variant="info" className="mb-3">
             <ShieldAlertIcon />
             <AlertTitle>Limited permissions</AlertTitle>
             <AlertDescription>
@@ -268,46 +310,53 @@ export function PluginsSettingsPanel() {
           </Alert>
         ) : null}
 
-        {status.data?.errors.map((error) => (
-          <Alert
-            key={error.directory}
-            variant="error"
-            className="mb-2"
-            data-plugin-error={error.directory}
-          >
-            <CircleAlertIcon />
-            <AlertTitle>{error.directory}</AlertTitle>
-            <AlertDescription>{error.error}</AlertDescription>
-          </Alert>
-        ))}
-
         {status.isPending && status.data === null ? (
-          <Empty className="min-h-52 gap-2 text-sm text-muted-foreground">
+          <Empty size="compact">
             <Spinner className="size-4" />
-            Loading plugins
+            <EmptyDescription>Loading plugins</EmptyDescription>
           </Empty>
         ) : null}
 
         {!status.isPending &&
         status.error === null &&
         packages.length === 0 &&
-        (status.data?.errors.length ?? 0) === 0 ? (
-          <Empty data-plugin-empty className="min-h-52">
+        discoveryErrors.length === 0 ? (
+          <Empty size="compact">
             <EmptyMedia variant="icon">
               <FolderCodeIcon />
             </EmptyMedia>
             <EmptyHeader>
-              <EmptyTitle>No plugins found</EmptyTitle>
+              <EmptyTitle>No plugins on {environment.label}</EmptyTitle>
               <EmptyDescription>
-                Add a trusted plugin package to this environment's userdata/plugins directory, then
-                refresh this page.
+                Install one by running <code>t3 plugin install &lt;folder&gt;</code> on that
+                machine, then rescan.
               </EmptyDescription>
             </EmptyHeader>
           </Empty>
         ) : null}
 
+        {packages.length > 0 ? (
+          <InputGroup className="mb-3">
+            <InputGroupAddon>
+              <SearchIcon aria-hidden className="size-3" />
+            </InputGroupAddon>
+            <InputGroupInput
+              type="search"
+              value={query}
+              onChange={(event) => setQuery(event.currentTarget.value)}
+              placeholder="Search plugins"
+              aria-label="Search plugins"
+              size="sm"
+            />
+          </InputGroup>
+        ) : null}
+
+        {packages.length > 0 && visiblePackages.length === 0 ? (
+          <p className="text-sm text-muted-foreground">No plugins match “{query.trim()}”.</p>
+        ) : null}
+
         <div className="space-y-2">
-          {packages.map((pluginPackage) => (
+          {visiblePackages.map((pluginPackage) => (
             <PluginPackageRow
               key={pluginPackage.id}
               pluginPackage={pluginPackage}
@@ -323,6 +372,20 @@ export function PluginsSettingsPanel() {
           ))}
         </div>
       </SettingsSection>
+
+      {discoveryErrors.length > 0 ? (
+        <SettingsSection title="Discovery errors">
+          <div className="space-y-2">
+            {discoveryErrors.map((error) => (
+              <Alert key={error.directory} variant="error">
+                <CircleAlertIcon />
+                <AlertTitle>{error.directory}</AlertTitle>
+                <AlertDescription>{error.error}</AlertDescription>
+              </Alert>
+            ))}
+          </div>
+        </SettingsSection>
+      ) : null}
     </SettingsPageContainer>
   );
 }

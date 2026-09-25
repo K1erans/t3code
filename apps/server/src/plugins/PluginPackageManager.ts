@@ -4,6 +4,7 @@ import * as NodeURL from "node:url";
 import {
   PluginCommandInvocationResult,
   type PluginCommandInvokeInput,
+  PluginPackageId,
   PluginPackageNotFoundError,
   PluginPackageOperationError,
   type PluginPackageDiscoveryError,
@@ -29,8 +30,8 @@ import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 
+import { writeFileStringAtomically } from "../atomicWrite.ts";
 import * as ServerConfig from "../config.ts";
-import * as ServerSettings from "../serverSettings.ts";
 import * as PluginCommandCatalog from "./PluginCommandCatalog.ts";
 import * as PluginStorage from "./PluginStorage.ts";
 import { isHiddenPluginEntry, MANIFEST_FILE_NAME } from "./PluginInstall.ts";
@@ -38,6 +39,18 @@ import { isHiddenPluginEntry, MANIFEST_FILE_NAME } from "./PluginInstall.ts";
 const COMMAND_CAPABILITY = "t3.commands@1";
 const MAX_REASON_LENGTH = 2_000;
 const STORAGE_CAPABILITY = "t3.storage@0";
+/** Environment-owned plugin state, shared by every client connected to this environment. */
+const PLUGIN_STATE_FILE_NAME = "plugins.json";
+const MAX_ICON_BYTES = 32 * 1024;
+const ICON_MIME_TYPES: Readonly<Record<string, string>> = {
+  ".png": "image/png",
+  ".svg": "image/svg+xml",
+};
+/**
+ * Capabilities superseded by a newer major, mapped to the T3 version in which
+ * they stop working. Plugins requiring one get an "Older API" warning.
+ */
+const DEPRECATED_CAPABILITIES: ReadonlyMap<string, string> = new Map();
 
 interface DiscoveredPackage {
   readonly directory: string;
@@ -115,6 +128,11 @@ const failureReason = (entryPoint: string, outcome: EntryPointOutcome, error: un
 };
 
 const decodeManifestJson = Schema.decodeUnknownEffect(Schema.fromJsonString(PluginManifest));
+const PluginStateJson = Schema.fromJsonString(
+  Schema.Struct({ enabled: Schema.Array(PluginPackageId) }),
+);
+const decodePluginStateJson = Schema.decodeUnknownEffect(PluginStateJson);
+const encodePluginStateJson = Schema.encodeEffect(PluginStateJson);
 const decodeInvocationResult = Schema.decodeUnknownEffect(PluginCommandInvocationResult);
 const isPluginPackageOperationError = Schema.is(PluginPackageOperationError);
 const isPluginEntryPointError = Schema.is(PluginEntryPointError);
@@ -266,7 +284,6 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const config = yield* ServerConfig.ServerConfig;
-  const settings = yield* ServerSettings.ServerSettingsService;
   const catalog = yield* PluginCommandCatalog.PluginCommandCatalog;
   const semaphore = yield* Semaphore.make(1);
   const pluginsDirectory = path.join(config.stateDir, "plugins");
@@ -278,6 +295,7 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
   yield* Effect.addFinalizer((exit) => Scope.close(storageScope, exit));
   // One store per plugin id, shared across reloads so update serialization spans generations.
   const openStores = new Map<string, PluginDataAccess>();
+  const pluginStatePath = path.join(config.stateDir, PLUGIN_STATE_FILE_NAME);
   const activeDefinitions = new Map<string, PluginDefinition>();
   const activeCacheDirectories = new Map<string, string>();
   const activeManifests = new Map<string, PluginManifestType>();
@@ -560,19 +578,53 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
     return [...definitions.values()].sort((left, right) => left.id.localeCompare(right.id));
   };
 
-  const readEnabledIds = settings.getSettings.pipe(
-    Effect.map((current) => new Set(current.enabledPluginIds)),
-  );
+  const readEnabledIds = Effect.gen(function* () {
+    if (!(yield* fileSystem.exists(pluginStatePath))) return new Set<string>();
+    const state = yield* fileSystem
+      .readFileString(pluginStatePath)
+      .pipe(Effect.flatMap(decodePluginStateJson));
+    return new Set<string>(state.enabled);
+  });
 
   const persistEnabledIds = (
     ids: ReadonlySet<string>,
     operation: PluginPackageOperation,
     id?: string,
   ) =>
-    settings.setEnabledPluginIds([...ids].sort()).pipe(
+    encodePluginStateJson({ enabled: [...ids].sort() }).pipe(
+      Effect.flatMap((contents) =>
+        writeFileStringAtomically({ filePath: pluginStatePath, contents: `${contents}\n` }),
+      ),
+      Effect.provideService(FileSystem.FileSystem, fileSystem),
+      Effect.provideService(Path.Path, path),
       Effect.mapError((error) => operationError(operation, error, id)),
-      Effect.asVoid,
     );
+
+  const iconCache = new Map<string, { readonly stamp: string; readonly url: string }>();
+
+  /**
+   * Inlines a small package icon so every client, local or remote, can render it.
+   * Encoded icons are cached by path, size and mtime so status refreshes skip the read.
+   */
+  const readIconUrl = (directory: string, icon: string | undefined) =>
+    Effect.gen(function* () {
+      if (icon === undefined) return undefined;
+      const mimeType = ICON_MIME_TYPES[path.extname(icon).toLowerCase()];
+      if (mimeType === undefined) return undefined;
+      const iconPath = path.resolve(directory, icon);
+      const canonicalDirectory = yield* fileSystem.realPath(directory);
+      const canonicalIcon = yield* fileSystem.realPath(iconPath);
+      if (!canonicalIcon.startsWith(`${canonicalDirectory}${path.sep}`)) return undefined;
+      const info = yield* fileSystem.stat(canonicalIcon);
+      if (info.type !== "File" || Number(info.size) > MAX_ICON_BYTES) return undefined;
+      const stamp = `${info.size}:${Option.match(info.mtime, { onNone: () => "", onSome: (mtime) => mtime.getTime() })}`;
+      const cached = iconCache.get(canonicalIcon);
+      if (cached?.stamp === stamp) return cached.url;
+      const bytes = yield* fileSystem.readFile(canonicalIcon);
+      const url = `data:${mimeType};base64,${Buffer.from(bytes).toString("base64")}`;
+      iconCache.set(canonicalIcon, { stamp, url });
+      return url;
+    }).pipe(Effect.orElseSucceed(() => undefined));
 
   const statusUnlocked = Effect.fn("PluginPackageManager.status")(function* (
     operation: PluginPackageOperation,
@@ -593,18 +645,29 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
       const activeManifest = activeManifests.get(id);
       const packageManifest = activeManifest ?? discovered.get(id)?.manifest;
       if (packageManifest === undefined) continue;
+      const directory = discovered.get(id)?.directory ?? path.join(pluginsDirectory, id);
+      const iconUrl = yield* readIconUrl(directory, packageManifest.icon);
+      const olderApiRemovedIn = packageManifest.capabilities
+        .map((capability) => DEPRECATED_CAPABILITIES.get(capability))
+        .find((version) => version !== undefined);
       const enabled = enabledIds.has(id);
       const active = activeDefinitions.has(id);
       const error =
         packageErrors.get(id) ?? (enabled && !active ? "enabled package is not active" : undefined);
       packages.push({
         id: packageManifest.id,
+        name: packageManifest.name?.trim() || packageManifest.id,
+        ...(packageManifest.description?.trim()
+          ? { description: packageManifest.description.trim() }
+          : {}),
+        ...(iconUrl === undefined ? {} : { iconUrl }),
         version: packageManifest.version,
         apiVersion: packageManifest.apiVersion,
         enabled,
         state: error !== undefined ? "error" : active ? "active" : "disabled",
         capabilities: [...packageManifest.capabilities],
         contributions: { commands: [...(packageManifest.contributes?.commands ?? [])] },
+        ...(olderApiRemovedIn === undefined ? {} : { olderApiRemovedIn }),
         ...(error === undefined ? {} : { error }),
       });
     }
@@ -673,7 +736,7 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
                 if (rolledBack._tag === "Failure") {
                   packageErrors.set(id, detailFromCause(reconciled.cause));
                   yield* removeCacheDirectory(loaded.cacheDirectory);
-                  yield* Effect.logWarning("Failed to restore enabled package settings", {
+                  yield* Effect.logWarning("Failed to restore enabled plugin state", {
                     id,
                     error: rolledBack.cause,
                   });
@@ -741,7 +804,7 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
               persistEnabledIds(previousEnabledIds, "disable", id),
             );
             if (rolledBack._tag === "Failure") {
-              yield* Effect.logWarning("Failed to restore enabled package settings", {
+              yield* Effect.logWarning("Failed to restore enabled plugin state", {
                 id,
                 error: rolledBack.cause,
               });
@@ -847,7 +910,6 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
     return yield* statusUnlocked("rescan");
   });
 
-  yield* settings.start.pipe(Effect.mapError((error) => operationError("status", error)));
   yield* fileSystem
     .remove(pluginCacheDirectory, { recursive: true, force: true })
     .pipe(Effect.mapError((error) => operationError("status", error)));

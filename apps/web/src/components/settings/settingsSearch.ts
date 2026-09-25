@@ -842,7 +842,7 @@ const SETTINGS_CATEGORY_SCOPES: Readonly<Record<SettingsPath, SettingsSearchScop
   "/settings/keybindings": null,
   "/settings/providers": null,
   "/settings/integrations": null,
-  // Plugins manages the primary environment only.
+  // Plugins shows the representative environment at any selection, like Providers.
   "/settings/plugins": null,
   "/settings/source-control": "environment-defaults",
   "/settings/storage": "project-defaults",
