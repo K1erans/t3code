@@ -664,7 +664,7 @@ export const make = (options: PluginRuntimeOptions = {}) =>
         }),
       );
 
-    const runTransition = <Result, Failure, Requirements>(
+    const rejectReentrancy = <Result, Failure, Requirements>(
       operation: RuntimeOperation,
       effect: () => Effect.Effect<Result, Failure, Requirements>,
     ): Effect.Effect<Result, Failure | PluginRuntimeReentrancyError, Requirements> =>
@@ -684,18 +684,28 @@ export const make = (options: PluginRuntimeOptions = {}) =>
                 }),
               );
             }
-            return transitionSemaphore.withPermits(1)(effect());
+            return effect();
           },
         );
       });
 
+    const runTransition = <Result, Failure, Requirements>(
+      operation: RuntimeOperation,
+      effect: () => Effect.Effect<Result, Failure, Requirements>,
+    ): Effect.Effect<Result, Failure | PluginRuntimeReentrancyError, Requirements> =>
+      rejectReentrancy(operation, () => transitionSemaphore.withPermits(1)(effect()));
+
+    // Invocations read the committed composition without the transition lock, so a slow
+    // contribution never delays reconcile, dispose or other invocations. An invocation
+    // that is running when its plugin retires keeps running to completion; the host
+    // decides whether its outcome still matters. A disposed runtime starts no new ones.
     const useContribution = <Value, Success, Failure, Requirements>(
       slot: string,
       id: string,
       generation: number,
       use: (value: Value) => Effect.Effect<Success, Failure, Requirements>,
     ): Effect.Effect<Success, Failure | PluginRuntimeContributionError, Requirements> =>
-      runTransition("invoke", () =>
+      rejectReentrancy("invoke", () =>
         Effect.suspend<
           Success,
           | Failure

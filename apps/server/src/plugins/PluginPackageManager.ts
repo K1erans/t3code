@@ -13,18 +13,17 @@ import {
   type PluginPackageStatusSnapshot,
 } from "@t3tools/contracts";
 import type { PluginActivationContext, PluginDefinition } from "@t3tools/plugin-runtime";
-import {
-  PluginManifest,
-  type PluginManifest as PluginManifestType,
-} from "@t3tools/plugin-runtime/manifest";
+import type { PluginManifest } from "@t3tools/plugin-runtime/manifest";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
@@ -34,7 +33,12 @@ import { writeFileStringAtomically } from "../atomicWrite.ts";
 import * as ServerConfig from "../config.ts";
 import * as PluginCommandCatalog from "./PluginCommandCatalog.ts";
 import * as PluginStorage from "./PluginStorage.ts";
-import { isHiddenPluginEntry, MANIFEST_FILE_NAME } from "./PluginInstall.ts";
+import {
+  isHiddenPluginEntry,
+  MANIFEST_FILE_NAME,
+  readPluginManifest,
+  resolvePackageEntrypoint,
+} from "./PluginInstall.ts";
 
 const COMMAND_CAPABILITY = "t3.commands@0";
 /** `api.storage` and `api.dataDir`. */
@@ -54,22 +58,34 @@ const ICON_MIME_TYPES: Readonly<Record<string, string>> = {
  * they stop working. Plugins requiring one get an "Older API" warning.
  */
 const DEPRECATED_CAPABILITIES: ReadonlyMap<string, string> = new Map();
+/** The fingerprint of a package tree that cannot be loaded as it stands (for example a symlink). */
+const INVALID_PACKAGE_TREE = "invalid";
 
 interface DiscoveredPackage {
   readonly directory: string;
-  readonly manifest: PluginManifestType;
+  readonly manifest: PluginManifest & { readonly entrypoints: { readonly server: string } };
 }
 
 interface DiscoveryResult {
   readonly errors: ReadonlyArray<PluginPackageDiscoveryError>;
-  readonly packages: ReadonlyMap<string, DiscoveredPackage>;
+  readonly packages: ReadonlyMap<PluginPackageId, DiscoveredPackage>;
 }
 
-interface LoadedDefinition {
-  readonly cacheDirectory: string;
+/** One loaded version of a package, live in the runtime. */
+interface ActivePlugin {
   readonly definition: PluginDefinition;
+  readonly manifest: PluginManifest;
+  readonly cacheDirectory: string;
+  /** The folder fingerprint this version was loaded from. */
   readonly fingerprint: string;
+  /** Settles once the runtime has disposed this version. */
   readonly retired: Promise<void>;
+}
+
+interface PackageError {
+  readonly reason: string;
+  /** The loaded version that failed; absent when the package failed to load at all. */
+  readonly source?: PluginDefinition;
 }
 
 interface PluginDataAccess {
@@ -130,7 +146,6 @@ const failureReason = (entryPoint: string, outcome: EntryPointOutcome, error: un
     .trim();
 };
 
-const decodeManifestJson = Schema.decodeUnknownEffect(Schema.fromJsonString(PluginManifest));
 const PluginStateJson = Schema.fromJsonString(
   Schema.Struct({ enabled: Schema.Array(PluginPackageId) }),
 );
@@ -142,39 +157,49 @@ const isPluginEntryPointError = Schema.is(PluginEntryPointError);
 
 const detailFromUnknown = (error: unknown): string => {
   if (isPluginEntryPointError(error)) return error.reason;
-  if (isPluginPackageOperationError(error)) {
-    if (error.detail !== undefined) return error.detail;
-    if (error.cause !== undefined) return detailFromUnknown(error.cause);
-  }
+  if (isPluginPackageOperationError(error)) return error.detail;
   if (typeof error === "object" && error !== null && "cause" in error) {
     const cause = error.cause;
     if (cause !== undefined && cause !== error) return detailFromUnknown(cause);
   }
   const detail = error instanceof Error ? error.message : String(error);
   const trimmed = detail.trim();
-  return (trimmed.length === 0 ? "unknown error" : trimmed).slice(0, 2_000);
+  return (trimmed.length === 0 ? "unknown error" : trimmed).slice(0, MAX_REASON_LENGTH).trim();
 };
 
 const detailFromCause = (cause: Cause.Cause<unknown>): string =>
   detailFromUnknown(Cause.squash(cause));
 
+/** The wire error: a readable `detail` only, so no server paths or stacks reach clients. */
 const operationError = (
   operation: PluginPackageOperation,
   error: unknown,
-  id?: string,
-): PluginPackageOperationError => {
-  if (isPluginPackageOperationError(error)) return error;
-  return new PluginPackageOperationError({
-    ...(id === undefined ? {} : { id }),
-    operation,
-    ...(typeof error === "string" ? { detail: error } : { cause: error }),
-  });
-};
+  id?: PluginPackageId,
+): PluginPackageOperationError =>
+  isPluginPackageOperationError(error)
+    ? error
+    : new PluginPackageOperationError({
+        ...(id === undefined ? {} : { id }),
+        operation,
+        detail: detailFromUnknown(error),
+      });
+
+/** Maps an internal failure to the wire error, keeping the full cause in the server log. */
+const failOperation =
+  (operation: PluginPackageOperation, id?: PluginPackageId) => (error: unknown) =>
+    Effect.logWarning("Local plugin package operation failed", { operation, id, error }).pipe(
+      Effect.andThen(Effect.fail(operationError(operation, error, id))),
+    );
 
 interface DefinitionHooks {
   readonly guard: EntryPointGuard;
   readonly run: <A>(effect: Effect.Effect<A, PluginEntryPointError>) => Promise<A>;
-  readonly onCommandFailed: () => void;
+  /** A command or cleanup of `definition` failed; commands also retire it. */
+  readonly onFailure: (
+    definition: PluginDefinition,
+    reason: string,
+    entryPoint: "command" | "dispose",
+  ) => void;
   readonly onRetired: () => void;
 }
 
@@ -182,14 +207,14 @@ const makeDefinition = (
   discovered: DiscoveredPackage,
   activatePackage: PluginPackageActivator,
   data: PluginDataAccess | undefined,
-  { guard, run, onCommandFailed, onRetired }: DefinitionHooks,
+  { guard, run, onFailure, onRetired }: DefinitionHooks,
 ): PluginDefinition => {
   const declaredTitles = new Map(
     (discovered.manifest.contributes?.commands ?? []).map((command) => [command.id, command.title]),
   );
   const requires = new Set(discovered.manifest.requires);
 
-  return {
+  const definition: PluginDefinition = {
     id: discovered.manifest.id,
     version: discovered.manifest.version,
     activate(context: PluginActivationContext) {
@@ -197,7 +222,15 @@ const makeDefinition = (
       const api: PluginPackageApi = {
         ...data,
         onDispose(cleanup) {
-          context.onDispose(() => run(guard("dispose", cleanup)));
+          context.onDispose(() =>
+            run(
+              guard("dispose", cleanup).pipe(
+                Effect.tapError((error) =>
+                  Effect.sync(() => onFailure(definition, error.reason, "dispose")),
+                ),
+              ),
+            ),
+          );
         },
         registerCommand(command, handler) {
           if (!requires.has(COMMAND_CAPABILITY)) {
@@ -215,7 +248,9 @@ const makeDefinition = (
               surfaces: command.surfaces,
             },
             handler: guard(`command ${command.id}`, handler).pipe(
-              Effect.tapError(() => Effect.sync(onCommandFailed)),
+              Effect.tapError((error) =>
+                Effect.sync(() => onFailure(definition, error.reason, "command")),
+              ),
               Effect.mapError(
                 (cause) =>
                   new PluginCommandCatalog.PluginCommandExecutionError({ cause, id: command.id }),
@@ -238,36 +273,38 @@ const makeDefinition = (
       return run(guard("activate", () => activatePackage(api)));
     },
   };
+  return definition;
 };
 
 export class PluginPackageManager extends Context.Service<
   PluginPackageManager,
   {
+    /** Reads current state without waiting for a running enable, reload or rescan. */
     readonly status: Effect.Effect<PluginPackageStatusSnapshot, PluginPackageOperationError>;
     /** Invokes a catalog command, then retires any plugin whose command failed. */
     readonly invokeCommand: PluginCommandCatalog.PluginCommandCatalog["Service"]["invoke"];
     readonly enable: (
-      id: string,
+      id: PluginPackageId,
     ) => Effect.Effect<
       PluginPackageStatusSnapshot,
       PluginPackageNotFoundError | PluginPackageOperationError
     >;
     readonly disable: (
-      id: string,
+      id: PluginPackageId,
     ) => Effect.Effect<
       PluginPackageStatusSnapshot,
       PluginPackageNotFoundError | PluginPackageOperationError
     >;
     readonly reload: (
-      id: string,
+      id: PluginPackageId,
     ) => Effect.Effect<
       PluginPackageStatusSnapshot,
       PluginPackageNotFoundError | PluginPackageOperationError
     >;
     /**
      * Re-discovers `plugins/`: retires active packages whose folder is gone
-     * and reloads enabled packages whose folder changed since they were last
-     * loaded. New packages simply appear disabled.
+     * and loads enabled packages whose folder changed since they were last
+     * loaded or last failed to load. New packages simply appear disabled.
      */
     readonly rescan: Effect.Effect<PluginPackageStatusSnapshot, PluginPackageOperationError>;
   }
@@ -275,20 +312,36 @@ export class PluginPackageManager extends Context.Service<
 
 /** Long enough to fold the burst of events one install or copy produces. */
 export const WATCH_DEBOUNCE = Duration.millis(250);
+/** Waits between attempts to re-establish a lost watch: doubling from 250ms, capped at 30s. */
+export const WATCH_RETRY = Schedule.min([
+  Schedule.exponential(WATCH_DEBOUNCE),
+  Schedule.spaced("30 seconds"),
+]);
 
 /**
  * Runs `rescan` once per debounced burst of top-level `plugins/` events.
- * Failures are logged and never stop the watch.
+ * Rescan failures are logged and never stop the watch. When the watch itself
+ * ends or fails (for example because `plugins/` was deleted), `prepare`
+ * recreates the folder and the watch is re-established with a backoff, starting
+ * with one rescan to catch up on changes made while it was down.
  */
-export const watchPluginsDirectory = <E, R, RescanError>(
+export const watchPluginsDirectory = <E, R, PrepareError, RescanError>(
   events: Stream.Stream<unknown, E, R>,
+  prepare: Effect.Effect<void, PrepareError>,
   rescan: Effect.Effect<unknown, RescanError>,
-) =>
-  events.pipe(
-    Stream.debounce(WATCH_DEBOUNCE),
-    Stream.runForEach(() => rescan.pipe(Effect.ignoreCause({ log: true }))),
+) => {
+  const watch = (source: Stream.Stream<unknown, E, R>) =>
+    source.pipe(
+      Stream.debounce(WATCH_DEBOUNCE),
+      Stream.runForEach(() => rescan.pipe(Effect.ignoreCause({ log: true }))),
+      Effect.ignoreCause({ log: true }),
+    );
+  const reestablish = prepare.pipe(
+    Effect.andThen(watch(Stream.concat(Stream.make(undefined), events))),
     Effect.ignoreCause({ log: true }),
   );
+  return watch(events).pipe(Effect.andThen(reestablish.pipe(Effect.repeat(WATCH_RETRY))));
+};
 
 export const make = Effect.fn("PluginPackageManager.make")(function* (
   options: PluginPackageManagerOptions = {},
@@ -297,6 +350,7 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
   const path = yield* Path.Path;
   const config = yield* ServerConfig.ServerConfig;
   const catalog = yield* PluginCommandCatalog.PluginCommandCatalog;
+  // Serializes enable, disable, reload, rescan and retirement. Status and commands never take it.
   const semaphore = yield* Semaphore.make(1);
   const pluginsDirectory = path.join(config.stateDir, "plugins");
   const pluginCacheDirectory = path.join(config.stateDir, "plugin-cache");
@@ -306,30 +360,27 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
   const storageScope = yield* Scope.make();
   yield* Effect.addFinalizer((exit) => Scope.close(storageScope, exit));
   // One store per plugin id, shared across reloads so update serialization spans generations.
-  const openStores = new Map<string, PluginDataAccess>();
+  const openStores = new Map<PluginPackageId, PluginDataAccess>();
   const pluginStatePath = path.join(config.stateDir, PLUGIN_STATE_FILE_NAME);
-  const activeDefinitions = new Map<string, PluginDefinition>();
-  const activeCacheDirectories = new Map<string, string>();
-  const activeManifests = new Map<string, PluginManifestType>();
-  const activeRetirements = new Map<string, Promise<void>>();
-  const packageErrors = new Map<string, string>();
-  const failedCommandPlugins = new Set<string>();
+  const active = new Map<PluginPackageId, ActivePlugin>();
+  const packageErrors = new Map<PluginPackageId, PackageError>();
+  // Live versions with a failed command, retired once the invocation returns.
+  const failedCommands = new Set<PluginDefinition>();
+  // The folder fingerprint of each package's last failed load or failed-command
+  // retirement, so rescans and watch events do not re-import unchanged broken code.
+  const failedFingerprints = new Map<PluginPackageId, string>();
   const entryPointTimeout = Duration.fromInputUnsafe(options.entryPointTimeout ?? "30 seconds");
   const runEntryPoint = Effect.runPromiseWith(yield* Effect.context<never>());
-  // The folder fingerprint each active package was loaded from, so a rescan
-  // reloads only what changed and retries packages that failed to load.
-  const loadedFingerprints = new Map<string, string>();
   let loadSequence = 0;
 
   // The one wrapper around every call into plugin code (activate, commands, dispose).
   // The reason goes into the package status; the stack stays in the server log.
   const guardEntryPoint =
-    (id: string): EntryPointGuard =>
+    (id: PluginPackageId): EntryPointGuard =>
     (entryPoint, invoke) => {
       const fail = (outcome: EntryPointOutcome, error: unknown) =>
         Effect.gen(function* () {
           const reason = failureReason(entryPoint, outcome, error);
-          packageErrors.set(id, reason);
           yield* Effect.logWarning("Local plugin package entry point failed", {
             id,
             reason,
@@ -366,10 +417,18 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
       });
     };
 
-  // Every file's path, size, mtime and inode: in-place edits change the mtime,
-  // and a replaced folder has new inodes even when a copy preserves timestamps.
-  const fingerprint = (discovered: DiscoveredPackage) =>
-    validatePackageTree(discovered, "rescan").pipe(Effect.orElseSucceed(() => "unknown"));
+  // Commands run outside every lock, so an invocation can outlive the version it
+  // started on (a reload or disable finished meanwhile). Its failure belongs to
+  // that retired version: only the live version is marked failed or retired.
+  const recordEntryPointFailure = (
+    definition: PluginDefinition,
+    reason: string,
+    entryPoint: "command" | "dispose",
+  ) => {
+    if (active.get(definition.id)?.definition !== definition) return;
+    packageErrors.set(definition.id, { reason, source: definition });
+    if (entryPoint === "command") failedCommands.add(definition);
+  };
 
   const removeCacheDirectory = (directory: string) =>
     fileSystem
@@ -381,7 +440,7 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
       );
 
   const dataAccessFor = Effect.fn("PluginPackageManager.dataAccessFor")(function* (
-    id: string,
+    id: PluginPackageId,
     operation: PluginPackageOperation,
   ) {
     const existing = openStores.get(id);
@@ -391,20 +450,24 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
       Scope.provide(storageScope),
       Effect.provideService(FileSystem.FileSystem, fileSystem),
       Effect.provideService(Path.Path, path),
-      Effect.mapError((error) => operationError(operation, error, id)),
+      Effect.catch(failOperation(operation, id)),
     );
     const access = { dataDir, storage } satisfies PluginDataAccess;
     openStores.set(id, access);
     return access;
   });
 
+  // Every file's path, size, mtime and inode: in-place edits change the mtime,
+  // and a replaced folder has new inodes even when a copy preserves timestamps.
+  // Fails when the tree holds a symbolic link, which trusted packages must not.
   const validatePackageTree = Effect.fn("PluginPackageManager.validatePackageTree")(function* (
     discovered: DiscoveredPackage,
     operation: PluginPackageOperation,
   ) {
+    const id = discovered.manifest.id;
     const canonicalPluginsDirectory = yield* fileSystem
       .realPath(pluginsDirectory)
-      .pipe(Effect.mapError((error) => operationError(operation, error, discovered.manifest.id)));
+      .pipe(Effect.catch(failOperation(operation, id)));
     const relativeRoot = path.relative(pluginsDirectory, discovered.directory);
     const pending: Array<readonly [lexical: string, expectedCanonical: string]> = [
       [discovered.directory, path.resolve(canonicalPluginsDirectory, relativeRoot)],
@@ -416,17 +479,15 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
       const [lexical, expectedCanonical] = current;
       const canonical = yield* fileSystem
         .realPath(lexical)
-        .pipe(Effect.mapError((error) => operationError(operation, error, discovered.manifest.id)));
+        .pipe(Effect.catch(failOperation(operation, id)));
       if (path.normalize(canonical) !== path.normalize(expectedCanonical)) {
         return yield* operationError(
           operation,
           "symbolic links are not supported in trusted local plugin packages",
-          discovered.manifest.id,
+          id,
         );
       }
-      const info = yield* fileSystem
-        .stat(lexical)
-        .pipe(Effect.mapError((error) => operationError(operation, error, discovered.manifest.id)));
+      const info = yield* fileSystem.stat(lexical).pipe(Effect.catch(failOperation(operation, id)));
       stamps.push(
         [
           path.relative(discovered.directory, lexical),
@@ -439,7 +500,7 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
       if (info.type !== "Directory") continue;
       const entries = yield* fileSystem
         .readDirectory(lexical)
-        .pipe(Effect.mapError((error) => operationError(operation, error, discovered.manifest.id)));
+        .pipe(Effect.catch(failOperation(operation, id)));
       for (const entry of entries) {
         pending.push([path.join(lexical, entry), path.join(expectedCanonical, entry)]);
       }
@@ -447,41 +508,46 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
     return NodeCrypto.createHash("sha256").update(stamps.sort().join("\n")).digest("hex");
   });
 
+  const fingerprint = (discovered: DiscoveredPackage) =>
+    validatePackageTree(discovered, "rescan").pipe(
+      Effect.orElseSucceed(() => INVALID_PACKAGE_TREE),
+    );
+
   const discover = Effect.fn("PluginPackageManager.discover")(function* (
     operation: PluginPackageOperation,
   ) {
     yield* fileSystem
       .makeDirectory(pluginsDirectory, { recursive: true })
-      .pipe(Effect.mapError((error) => operationError(operation, error)));
+      .pipe(Effect.catch(failOperation(operation)));
     const entries = yield* fileSystem
       .readDirectory(pluginsDirectory)
-      .pipe(Effect.mapError((error) => operationError(operation, error)));
-    const discovered = new Map<string, DiscoveredPackage>();
+      .pipe(Effect.catch(failOperation(operation)));
+    const discovered = new Map<PluginPackageId, DiscoveredPackage>();
     const errors: Array<PluginPackageDiscoveryError> = [];
 
     for (const entry of [...entries].sort()) {
       if (isHiddenPluginEntry(entry)) continue;
       const directory = path.join(pluginsDirectory, entry);
-      const manifestPath = path.join(directory, MANIFEST_FILE_NAME);
-      if (
-        !(yield* fileSystem
-          .exists(manifestPath)
-          .pipe(Effect.mapError((error) => operationError(operation, error))))
-      )
-        continue;
+      const hasManifest = yield* fileSystem
+        .exists(path.join(directory, MANIFEST_FILE_NAME))
+        .pipe(Effect.catch(failOperation(operation)));
+      if (!hasManifest) continue;
 
       const decoded = yield* Effect.exit(
-        fileSystem.readFileString(manifestPath).pipe(Effect.flatMap(decodeManifestJson)),
+        readPluginManifest(directory).pipe(
+          Effect.provideService(FileSystem.FileSystem, fileSystem),
+          Effect.provideService(Path.Path, path),
+        ),
       );
       if (decoded._tag === "Failure") {
-        errors.push({ directory: entry, error: detailFromCause(decoded.cause) });
+        const detail = Option.match(Cause.findErrorOption(decoded.cause), {
+          onNone: () => detailFromCause(decoded.cause),
+          onSome: (error) => error.detail.slice(0, MAX_REASON_LENGTH).trim(),
+        });
+        errors.push({ directory: entry, error: detail });
         continue;
       }
       const packageManifest = decoded.value;
-      if (packageManifest.entrypoints?.server === undefined) {
-        errors.push({ directory: entry, error: "manifest must define entrypoints.server" });
-        continue;
-      }
       if (discovered.has(packageManifest.id)) {
         errors.push({ directory: entry, error: `duplicate package id ${packageManifest.id}` });
         continue;
@@ -494,8 +560,10 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
 
   const loadDefinition = Effect.fn("PluginPackageManager.loadDefinition")(function* (
     discovered: DiscoveredPackage,
+    packageFingerprint: string,
     operation: PluginPackageOperation,
   ) {
+    const id = discovered.manifest.id;
     const missing = discovered.manifest.requires.filter(
       (capability) => !PROVIDED_CAPABILITIES.includes(capability),
     );
@@ -503,66 +571,47 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
       return yield* operationError(
         operation,
         `Needs ${missing.join(", ")}; this T3 provides ${PROVIDED_CAPABILITIES.join(", ")}. Update T3 or use an older version of the plugin.`,
-        discovered.manifest.id,
+        id,
       );
     }
-    const serverEntrypoint = discovered.manifest.entrypoints?.server;
-    if (serverEntrypoint === undefined) {
-      return yield* operationError(
-        operation,
-        "manifest must define entrypoints.server",
-        discovered.manifest.id,
-      );
-    }
-    const packageFingerprint = yield* validatePackageTree(discovered, operation);
+    const serverEntrypoint = discovered.manifest.entrypoints.server;
     const data = discovered.manifest.requires.includes(STORAGE_CAPABILITY)
-      ? yield* dataAccessFor(discovered.manifest.id, operation)
+      ? yield* dataAccessFor(id, operation)
       : undefined;
-    const sourceEntrypointPath = path.resolve(discovered.directory, serverEntrypoint);
-    const relativeEntrypoint = path.relative(discovered.directory, sourceEntrypointPath);
-    if (
-      relativeEntrypoint === ".." ||
-      relativeEntrypoint.startsWith(`..${path.sep}`) ||
-      path.isAbsolute(relativeEntrypoint)
-    ) {
-      return yield* operationError(
-        operation,
-        "entrypoint escapes the package directory",
-        discovered.manifest.id,
-      );
-    }
 
-    const cacheDirectory = path.join(
-      pluginCacheDirectory,
-      discovered.manifest.id,
-      String(loadSequence++),
-    );
+    const cacheDirectory = path.join(pluginCacheDirectory, id, String(loadSequence++));
+    const entrypointPath = resolvePackageEntrypoint(path, cacheDirectory, serverEntrypoint);
+    if (entrypointPath === undefined) {
+      return yield* operationError(operation, "entrypoints.server escapes the package", id);
+    }
     yield* fileSystem
       .makeDirectory(path.dirname(cacheDirectory), { recursive: true })
-      .pipe(Effect.mapError((error) => operationError(operation, error, discovered.manifest.id)));
+      .pipe(Effect.catch(failOperation(operation, id)));
     const copied = yield* Effect.exit(
       fileSystem
         .copy(discovered.directory, cacheDirectory)
-        .pipe(Effect.mapError((error) => operationError(operation, error, discovered.manifest.id))),
+        .pipe(Effect.catch(failOperation(operation, id))),
     );
     if (copied._tag === "Failure") {
       yield* removeCacheDirectory(cacheDirectory);
       return yield* Effect.failCause(copied.cause);
     }
-    const entrypointPath = path.resolve(cacheDirectory, serverEntrypoint);
 
+    // Each load imports a fresh cache URL so reloads see new code. Node never
+    // unloads ES modules, so every load stays in memory until the server
+    // restarts; rescans therefore skip unchanged packages, including ones whose
+    // last load failed.
     const loaded = yield* Effect.exit(
       Effect.gen(function* () {
         const moduleUrl = NodeURL.pathToFileURL(entrypointPath);
-        const module = yield* Effect.tryPromise({
-          try: () => import(/* @vite-ignore */ moduleUrl.href) as Promise<Record<string, unknown>>,
-          catch: (cause) => operationError(operation, cause, discovered.manifest.id),
-        });
+        const module = yield* Effect.tryPromise(
+          () => import(/* @vite-ignore */ moduleUrl.href) as Promise<Record<string, unknown>>,
+        ).pipe(Effect.catch(failOperation(operation, id)));
         if (typeof module.default !== "function") {
           return yield* operationError(
             operation,
             "server entrypoint must export a default activation function",
-            discovered.manifest.id,
+            id,
           );
         }
         return module.default as PluginPackageActivator;
@@ -578,40 +627,32 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
       markRetired = resolve;
     });
     return {
-      cacheDirectory,
       definition: makeDefinition(discovered, loaded.value, data, {
-        guard: guardEntryPoint(discovered.manifest.id),
+        guard: guardEntryPoint(id),
         run: runEntryPoint,
-        onCommandFailed: () => failedCommandPlugins.add(discovered.manifest.id),
+        onFailure: recordEntryPointFailure,
         onRetired: markRetired,
       }),
+      manifest: discovered.manifest,
+      cacheDirectory,
       fingerprint: packageFingerprint,
       retired,
-    } satisfies LoadedDefinition;
+    } satisfies ActivePlugin;
   });
 
-  const definitionList = (replacement?: readonly [string, PluginDefinition | undefined]) => {
-    const definitions = new Map(activeDefinitions);
-    if (replacement !== undefined) {
-      const [id, definition] = replacement;
-      if (definition === undefined) definitions.delete(id);
-      else definitions.set(id, definition);
-    }
-    return [...definitions.values()].sort((left, right) => left.id.localeCompare(right.id));
-  };
-
-  const readEnabledIds = Effect.gen(function* () {
-    if (!(yield* fileSystem.exists(pluginStatePath))) return new Set<string>();
-    const state = yield* fileSystem
-      .readFileString(pluginStatePath)
-      .pipe(Effect.flatMap(decodePluginStateJson));
-    return new Set<string>(state.enabled);
-  });
+  const readEnabledIds = (operation: PluginPackageOperation, id?: PluginPackageId) =>
+    Effect.gen(function* () {
+      if (!(yield* fileSystem.exists(pluginStatePath))) return new Set<PluginPackageId>();
+      const state = yield* fileSystem
+        .readFileString(pluginStatePath)
+        .pipe(Effect.flatMap(decodePluginStateJson));
+      return new Set<PluginPackageId>(state.enabled);
+    }).pipe(Effect.catch(failOperation(operation, id)));
 
   const persistEnabledIds = (
-    ids: ReadonlySet<string>,
+    ids: ReadonlySet<PluginPackageId>,
     operation: PluginPackageOperation,
-    id?: string,
+    id: PluginPackageId,
   ) =>
     encodePluginStateJson({ enabled: [...ids].sort() }).pipe(
       Effect.flatMap((contents) =>
@@ -619,8 +660,69 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
       ),
       Effect.provideService(FileSystem.FileSystem, fileSystem),
       Effect.provideService(Path.Path, path),
-      Effect.mapError((error) => operationError(operation, error, id)),
+      Effect.catch(failOperation(operation, id)),
     );
+
+  /** Puts the enabled set back after a change the runtime rolled back. */
+  const restoreEnabledIds = (
+    ids: ReadonlySet<PluginPackageId>,
+    operation: PluginPackageOperation,
+    id: PluginPackageId,
+  ) =>
+    persistEnabledIds(ids, operation, id).pipe(
+      Effect.catch((error) =>
+        Effect.logWarning("Failed to restore enabled plugin state", { id, error }),
+      ),
+    );
+
+  /**
+   * Reconciles the runtime with `id` replaced by `next`, or removed when `next`
+   * is undefined, and records the result. A failed reconcile normally keeps the
+   * previous composition live (`committed: false`, and `next`'s cache is
+   * removed); only a changed catalog generation means it committed anyway.
+   * Call inside `Effect.uninterruptibleMask`, passing its `restore`, so the
+   * bookkeeping always matches what the runtime did.
+   */
+  const commit = Effect.fnUntraced(function* (
+    operation: PluginPackageOperation,
+    id: PluginPackageId,
+    next: ActivePlugin | undefined,
+    restore: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>,
+  ) {
+    const definitions = [...active.values()]
+      .map((plugin) => plugin.definition)
+      .filter((definition) => definition.id !== id);
+    if (next !== undefined) definitions.push(next.definition);
+    definitions.sort((left, right) => left.id.localeCompare(right.id));
+
+    const before = (yield* catalog.list).generation;
+    const exit = yield* Effect.exit(
+      restore(catalog.reconcile(definitions).pipe(Effect.catch(failOperation(operation, id)))),
+    );
+    const committed = Exit.isSuccess(exit) || (yield* catalog.list).generation !== before;
+    if (!committed) {
+      if (next !== undefined) yield* removeCacheDirectory(next.cacheDirectory);
+      return { committed, exit };
+    }
+
+    const previous = active.get(id);
+    if (next === undefined) {
+      active.delete(id);
+    } else {
+      active.set(id, next);
+      failedFingerprints.delete(id);
+      // An error from the replaced version (say, its cleanup failing just now) is not this one's.
+      const error = packageErrors.get(id);
+      if (error?.source !== undefined && error.source !== next.definition) packageErrors.delete(id);
+    }
+    if (previous !== undefined) {
+      // In-flight commands of the retired version may still run from this copy; they
+      // already imported their code, and their outcome no longer affects the package.
+      yield* Effect.promise(() => previous.retired);
+      yield* removeCacheDirectory(previous.cacheDirectory);
+    }
+    return { committed, exit };
+  });
 
   const iconCache = new Map<string, { readonly stamp: string; readonly url: string }>();
 
@@ -648,24 +750,21 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
       return url;
     }).pipe(Effect.orElseSucceed(() => undefined));
 
-  const statusUnlocked = Effect.fn("PluginPackageManager.status")(function* (
+  const status = Effect.fn("PluginPackageManager.status")(function* (
     operation: PluginPackageOperation,
   ): Effect.fn.Return<PluginPackageStatusSnapshot, PluginPackageOperationError> {
     const [discovery, enabledIds] = yield* Effect.all(
-      [
-        discover(operation),
-        readEnabledIds.pipe(Effect.mapError((error) => operationError(operation, error))),
-      ],
+      [discover(operation), readEnabledIds(operation)],
       { concurrency: "unbounded" },
     );
     const discovered = discovery.packages;
     const errors = [...discovery.errors];
     const packages: Array<PluginPackageStatus> = [];
-    const packageIds = new Set([...discovered.keys(), ...activeManifests.keys()]);
+    const packageIds = new Set([...discovered.keys(), ...active.keys()]);
 
     for (const id of [...packageIds].sort()) {
-      const activeManifest = activeManifests.get(id);
-      const packageManifest = activeManifest ?? discovered.get(id)?.manifest;
+      const current = active.get(id);
+      const packageManifest = current?.manifest ?? discovered.get(id)?.manifest;
       if (packageManifest === undefined) continue;
       const directory = discovered.get(id)?.directory ?? path.join(pluginsDirectory, id);
       const iconUrl = yield* readIconUrl(directory, packageManifest.icon);
@@ -673,9 +772,7 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
         .map((capability) => DEPRECATED_CAPABILITIES.get(capability))
         .find((version) => version !== undefined);
       const enabled = enabledIds.has(id);
-      const active = activeDefinitions.has(id);
-      const error =
-        packageErrors.get(id) ?? (enabled && !active ? "enabled package is not active" : undefined);
+      const error = packageErrors.get(id)?.reason;
       packages.push({
         id: packageManifest.id,
         name: packageManifest.name.trim() || packageManifest.id,
@@ -685,7 +782,16 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
         ...(iconUrl === undefined ? {} : { iconUrl }),
         version: packageManifest.version,
         enabled,
-        state: error !== undefined ? "error" : active ? "active" : "disabled",
+        // Enabled without a live version or an error means activation has not
+        // run yet, as while startup activation is still in progress.
+        state:
+          error !== undefined
+            ? "error"
+            : current !== undefined
+              ? "active"
+              : enabled
+                ? "idle"
+                : "disabled",
         requires: [...packageManifest.requires],
         contributions: {
           commands: (packageManifest.contributes?.commands ?? []).map((command) => command.id),
@@ -695,6 +801,9 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
       });
     }
 
+    // Only enabled packages report "Not installed": they are the ones a client
+    // expects to be running. A removed disabled package has no state worth
+    // keeping, so it simply leaves the list (its data stays in plugin-data).
     for (const id of [...enabledIds].sort()) {
       if (!discovered.has(id)) {
         errors.push({ directory: id, error: "Not installed" });
@@ -705,182 +814,95 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
   });
 
   const transition = Effect.fn("PluginPackageManager.transition")(
-    (operation: "enable" | "reload", id: string) =>
+    (operation: "enable" | "reload", id: PluginPackageId) =>
       Effect.uninterruptibleMask((restore) =>
         Effect.gen(function* () {
           const discovery = yield* restore(discover(operation));
           const pluginPackage = discovery.packages.get(id);
           if (pluginPackage === undefined) return yield* new PluginPackageNotFoundError({ id });
-          const enabledIds = yield* restore(
-            readEnabledIds.pipe(Effect.mapError((error) => operationError(operation, error, id))),
-          );
+          const enabledIds = yield* restore(readEnabledIds(operation, id));
           if (operation === "reload" && !enabledIds.has(id)) {
             return yield* operationError(operation, "package is not enabled", id);
           }
-          if (operation === "enable" && activeDefinitions.has(id) && enabledIds.has(id)) {
-            return yield* statusUnlocked(operation);
+          if (operation === "enable" && active.has(id) && enabledIds.has(id)) {
+            return yield* status(operation);
           }
           packageErrors.delete(id);
-          failedCommandPlugins.delete(id);
 
-          const previousEnabledIds = new Set(enabledIds);
-          const previousCacheDirectory = activeCacheDirectories.get(id);
-          const previousRetirement = activeRetirements.get(id);
-          const loadedExit = yield* Effect.exit(restore(loadDefinition(pluginPackage, operation)));
-          if (loadedExit._tag === "Failure") {
-            packageErrors.set(id, detailFromCause(loadedExit.cause));
-            return yield* Effect.failCause(loadedExit.cause);
-          }
-          const loaded = loadedExit.value;
+          let attempted = INVALID_PACKAGE_TREE;
+          const failLoad = (cause: Cause.Cause<PluginPackageOperationError>) => {
+            packageErrors.set(id, { reason: detailFromCause(cause) });
+            failedFingerprints.set(id, attempted);
+            return Effect.failCause(cause);
+          };
+          const tree = yield* Effect.exit(restore(validatePackageTree(pluginPackage, operation)));
+          if (tree._tag === "Failure") return yield* failLoad(tree.cause);
+          attempted = tree.value;
+          const loaded = yield* Effect.exit(
+            restore(loadDefinition(pluginPackage, attempted, operation)),
+          );
+          if (loaded._tag === "Failure") return yield* failLoad(loaded.cause);
+
           if (operation === "enable") {
-            enabledIds.add(id);
-            const persisted = yield* Effect.exit(persistEnabledIds(enabledIds, operation, id));
+            const persisted = yield* Effect.exit(
+              persistEnabledIds(new Set([...enabledIds, id]), operation, id),
+            );
             if (persisted._tag === "Failure") {
-              packageErrors.set(id, detailFromCause(persisted.cause));
-              yield* removeCacheDirectory(loaded.cacheDirectory);
+              packageErrors.set(id, { reason: detailFromCause(persisted.cause) });
+              yield* removeCacheDirectory(loaded.value.cacheDirectory);
               return yield* Effect.failCause(persisted.cause);
             }
           }
-          const previousCatalog = yield* catalog.list;
-          const reconciled = yield* Effect.exit(
-            restore(
-              catalog
-                .reconcile(definitionList([id, loaded.definition]))
-                .pipe(Effect.mapError((error) => operationError(operation, error, id))),
-            ),
-          );
-          if (reconciled._tag === "Failure") {
-            const currentCatalog = yield* catalog.list;
-            if (currentCatalog.generation === previousCatalog.generation) {
-              if (operation === "enable") {
-                const rolledBack = yield* Effect.exit(
-                  persistEnabledIds(previousEnabledIds, operation, id),
-                );
-                if (rolledBack._tag === "Failure") {
-                  packageErrors.set(id, detailFromCause(reconciled.cause));
-                  yield* removeCacheDirectory(loaded.cacheDirectory);
-                  yield* Effect.logWarning("Failed to restore enabled plugin state", {
-                    id,
-                    error: rolledBack.cause,
-                  });
-                  return yield* Effect.failCause(reconciled.cause);
-                }
-              }
-              packageErrors.set(id, detailFromCause(reconciled.cause));
-              yield* removeCacheDirectory(loaded.cacheDirectory);
-              return yield* Effect.failCause(reconciled.cause);
-            }
+          const { committed, exit } = yield* commit(operation, id, loaded.value, restore);
+          if (Exit.isSuccess(exit)) return yield* status(operation);
+          if (!committed) {
+            if (operation === "enable") yield* restoreEnabledIds(enabledIds, operation, id);
+            return yield* failLoad(exit.cause);
           }
-
-          activeDefinitions.set(id, loaded.definition);
-          loadedFingerprints.set(id, loaded.fingerprint);
-          activeCacheDirectories.set(id, loaded.cacheDirectory);
-          activeManifests.set(id, pluginPackage.manifest);
-          activeRetirements.set(id, loaded.retired);
-          if (reconciled._tag === "Success") {
-            // A command of the previous version can fail while reconcile waits for it; that
-            // failure belongs to the retired version and must not retire or mark this one.
-            packageErrors.delete(id);
-            failedCommandPlugins.delete(id);
-          }
-          if (previousCacheDirectory !== undefined) {
-            if (reconciled._tag === "Failure" && previousRetirement !== undefined) {
-              yield* Effect.promise(() => previousRetirement);
-            }
-            yield* removeCacheDirectory(previousCacheDirectory);
-          }
-          if (reconciled._tag === "Failure") return yield* Effect.failCause(reconciled.cause);
-          return yield* statusUnlocked(operation);
+          return yield* Effect.failCause(exit.cause);
         }),
       ),
   );
 
-  const disableUnlocked = Effect.fn("PluginPackageManager.disable")((id: string) =>
+  const disable = Effect.fn("PluginPackageManager.disable")((id: PluginPackageId) =>
     Effect.uninterruptibleMask((restore) =>
       Effect.gen(function* () {
         const discovery = yield* restore(discover("disable"));
-        const enabledIds = yield* restore(
-          readEnabledIds.pipe(Effect.mapError((error) => operationError("disable", error, id))),
-        );
-        if (!discovery.packages.has(id) && !enabledIds.has(id) && !activeDefinitions.has(id)) {
+        const enabledIds = yield* restore(readEnabledIds("disable", id));
+        if (!discovery.packages.has(id) && !enabledIds.has(id) && !active.has(id)) {
           return yield* new PluginPackageNotFoundError({ id });
         }
         packageErrors.delete(id);
-        failedCommandPlugins.delete(id);
+        failedFingerprints.delete(id);
 
-        const previousEnabledIds = new Set(enabledIds);
-        enabledIds.delete(id);
-        const persisted = yield* Effect.exit(persistEnabledIds(enabledIds, "disable", id));
-        if (persisted._tag === "Failure") return yield* Effect.failCause(persisted.cause);
-        const previousCatalog = yield* catalog.list;
-        const reconciled = yield* Effect.exit(
-          restore(
-            catalog
-              .reconcile(definitionList([id, undefined]))
-              .pipe(Effect.mapError((error) => operationError("disable", error, id))),
-          ),
-        );
-        if (reconciled._tag === "Failure") {
-          const currentCatalog = yield* catalog.list;
-          if (currentCatalog.generation === previousCatalog.generation) {
-            const rolledBack = yield* Effect.exit(
-              persistEnabledIds(previousEnabledIds, "disable", id),
-            );
-            if (rolledBack._tag === "Failure") {
-              yield* Effect.logWarning("Failed to restore enabled plugin state", {
-                id,
-                error: rolledBack.cause,
-              });
-              return yield* Effect.failCause(reconciled.cause);
-            }
-            return yield* Effect.failCause(reconciled.cause);
-          }
+        const remaining = new Set(enabledIds);
+        remaining.delete(id);
+        yield* persistEnabledIds(remaining, "disable", id);
+        if (active.has(id)) {
+          const { committed, exit } = yield* commit("disable", id, undefined, restore);
+          if (!committed) yield* restoreEnabledIds(enabledIds, "disable", id);
+          if (Exit.isFailure(exit)) return yield* Effect.failCause(exit.cause);
         }
-
-        activeDefinitions.delete(id);
-        activeManifests.delete(id);
-        const cacheDirectory = activeCacheDirectories.get(id);
-        const retirement = activeRetirements.get(id);
-        activeCacheDirectories.delete(id);
-        activeRetirements.delete(id);
-        if (cacheDirectory !== undefined) {
-          if (reconciled._tag === "Failure" && retirement !== undefined) {
-            yield* Effect.promise(() => retirement);
-          }
-          yield* removeCacheDirectory(cacheDirectory);
-        }
-        if (reconciled._tag === "Failure") return yield* Effect.failCause(reconciled.cause);
-        return yield* statusUnlocked("disable");
+        return yield* status("disable");
       }),
     ),
   );
 
   // A failed command leaves its package enabled but inactive, showing the reason until Reload.
-  const retireFailedCommandPlugins = Effect.uninterruptible(
+  const retireFailedCommands = Effect.uninterruptibleMask((restore) =>
     Effect.gen(function* () {
-      for (const id of failedCommandPlugins) {
-        failedCommandPlugins.delete(id);
-        if (!activeDefinitions.has(id)) continue;
-        const previousCatalog = yield* catalog.list;
-        const reconciled = yield* Effect.exit(catalog.reconcile(definitionList([id, undefined])));
-        if (
-          reconciled._tag === "Failure" &&
-          (yield* catalog.list).generation === previousCatalog.generation
-        ) {
+      for (const definition of failedCommands) {
+        failedCommands.delete(definition);
+        const failed = active.get(definition.id);
+        if (failed?.definition !== definition) continue;
+        const { committed, exit } = yield* commit("disable", definition.id, undefined, restore);
+        // Rescans leave the unchanged folder alone; Reload or an edit brings it back.
+        if (committed) failedFingerprints.set(definition.id, failed.fingerprint);
+        else if (Exit.isFailure(exit)) {
           yield* Effect.logWarning("Failed to retire failed local plugin package", {
-            id,
-            error: detailFromCause(reconciled.cause),
+            id: definition.id,
+            error: detailFromCause(exit.cause),
           });
-          continue;
-        }
-        const cacheDirectory = activeCacheDirectories.get(id);
-        const retirement = activeRetirements.get(id);
-        activeDefinitions.delete(id);
-        activeCacheDirectories.delete(id);
-        activeRetirements.delete(id);
-        if (cacheDirectory !== undefined) {
-          if (retirement !== undefined) yield* Effect.promise(() => retirement);
-          yield* removeCacheDirectory(cacheDirectory);
         }
       }
     }),
@@ -888,33 +910,15 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
 
   const rescanUnlocked = Effect.fn("PluginPackageManager.rescan")(function* () {
     const discovery = yield* discover("rescan");
-    const enabledIds = yield* readEnabledIds.pipe(
-      Effect.mapError((error) => operationError("rescan", error)),
-    );
+    const enabledIds = yield* readEnabledIds("rescan");
 
-    const removed = new Set(
-      [...activeDefinitions.keys()].filter((id) => !discovery.packages.has(id)),
-    );
-    if (removed.size > 0) {
-      const retired = yield* Effect.exit(
-        catalog.reconcile(
-          [...activeDefinitions.values()]
-            .filter((definition) => !removed.has(definition.id))
-            .sort((left, right) => left.id.localeCompare(right.id)),
-        ),
+    for (const id of [...active.keys()].sort()) {
+      if (discovery.packages.has(id)) continue;
+      const { committed, exit } = yield* Effect.uninterruptibleMask((restore) =>
+        commit("rescan", id, undefined, restore),
       );
-      if (retired._tag === "Failure") {
-        const detail = detailFromCause(retired.cause);
-        for (const id of removed) packageErrors.set(id, detail);
-      } else {
-        for (const id of removed) {
-          const cacheDirectory = activeCacheDirectories.get(id);
-          activeDefinitions.delete(id);
-          activeManifests.delete(id);
-          activeCacheDirectories.delete(id);
-          activeRetirements.delete(id);
-          if (cacheDirectory !== undefined) yield* removeCacheDirectory(cacheDirectory);
-        }
+      if (!committed && Exit.isFailure(exit)) {
+        packageErrors.set(id, { reason: detailFromCause(exit.cause) });
       }
     }
 
@@ -922,65 +926,38 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
       const pluginPackage = discovery.packages.get(id);
       if (pluginPackage === undefined) {
         // Gone: the status reports it as not installed until it returns.
-        loadedFingerprints.delete(id);
-        if (!activeDefinitions.has(id)) packageErrors.delete(id);
+        failedFingerprints.delete(id);
+        if (!active.has(id)) packageErrors.delete(id);
         continue;
       }
-      if (loadedFingerprints.get(id) === (yield* fingerprint(pluginPackage))) continue;
-      // A failed reload is recorded against the package and shown in status.
-      yield* Effect.exit(transition("reload", id));
+      const current = yield* fingerprint(pluginPackage);
+      if (current === active.get(id)?.fingerprint || current === failedFingerprints.get(id))
+        continue;
+      // A failed load is recorded against the package and shown in status.
+      const reloaded = yield* Effect.exit(transition("reload", id));
+      if (reloaded._tag === "Failure") {
+        yield* Effect.logWarning("Failed to load enabled local plugin package", {
+          id,
+          detail: detailFromCause(reloaded.cause),
+        });
+      }
     }
-    return yield* statusUnlocked("rescan");
+    return yield* status("rescan");
   });
 
   yield* fileSystem
     .remove(pluginCacheDirectory, { recursive: true, force: true })
-    .pipe(Effect.mapError((error) => operationError("status", error)));
+    .pipe(Effect.catch(failOperation("status")));
   yield* fileSystem
     .makeDirectory(pluginCacheDirectory, { recursive: true })
-    .pipe(Effect.mapError((error) => operationError("status", error)));
-  yield* fileSystem
-    .makeDirectory(pluginsDirectory, { recursive: true })
-    .pipe(Effect.mapError((error) => operationError("status", error)));
+    .pipe(Effect.catch(failOperation("status")));
 
   const startupDiscovery = yield* discover("status");
   for (const error of startupDiscovery.errors) {
     yield* Effect.logWarning("Invalid local plugin package", error);
   }
-  const startupEnabledIds = yield* readEnabledIds.pipe(
-    Effect.mapError((error) => operationError("status", error)),
-  );
-  for (const id of [...startupEnabledIds].sort()) {
-    const pluginPackage = startupDiscovery.packages.get(id);
-    if (pluginPackage === undefined) {
-      yield* Effect.logWarning("Enabled local plugin package was not discovered", { id });
-      continue;
-    }
-    const startup = yield* Effect.exit(
-      Effect.gen(function* () {
-        const loaded = yield* loadDefinition(pluginPackage, "status");
-        const reconciled = yield* Effect.exit(
-          catalog
-            .reconcile(definitionList([id, loaded.definition]))
-            .pipe(Effect.mapError((error) => operationError("status", error, id))),
-        );
-        if (reconciled._tag === "Failure") {
-          yield* removeCacheDirectory(loaded.cacheDirectory);
-          return yield* Effect.failCause(reconciled.cause);
-        }
-        activeDefinitions.set(id, loaded.definition);
-        loadedFingerprints.set(id, loaded.fingerprint);
-        activeCacheDirectories.set(id, loaded.cacheDirectory);
-        activeManifests.set(id, pluginPackage.manifest);
-        activeRetirements.set(id, loaded.retired);
-      }),
-    );
-    if (startup._tag === "Failure") {
-      const detail = detailFromCause(startup.cause);
-      packageErrors.set(id, detail);
-      yield* Effect.logWarning("Failed to activate enabled local plugin package", { id, detail });
-    }
-  }
+  // Unreadable plugin state fails here, leaving the environment up without plugins.
+  yield* readEnabledIds("status");
 
   yield* Effect.addFinalizer(() =>
     semaphore.withPermits(1)(
@@ -992,38 +969,68 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
           });
         }
         for (const [id, error] of packageErrors) {
-          yield* Effect.logWarning("Local plugin package reported a shutdown error", { id, error });
+          yield* Effect.logWarning("Local plugin package reported a shutdown error", {
+            id,
+            error: error.reason,
+          });
         }
         yield* removeCacheDirectory(pluginCacheDirectory);
       }),
     ),
   );
 
-  // Forked after the shutdown finalizer so it is interrupted first and cannot
-  // reload anything once shutdown has retired the packages.
   const rescan = semaphore.withPermits(1)(rescanUnlocked());
-  yield* watchPluginsDirectory(fileSystem.watch(pluginsDirectory), rescan).pipe(Effect.forkScoped);
+  // Forked after the shutdown finalizer so they are interrupted first and cannot
+  // load anything once shutdown has retired the packages. Plugins never delay
+  // server startup: enabled packages activate in the background, showing Idle
+  // until they do, through the same rescan that picks up later changes.
+  yield* rescan.pipe(Effect.ignoreCause({ log: true }), Effect.forkScoped);
+  yield* watchPluginsDirectory(
+    watchEvents(fileSystem, pluginsDirectory),
+    fileSystem.makeDirectory(pluginsDirectory, { recursive: true }),
+    rescan,
+  ).pipe(Effect.forkScoped);
 
   return {
-    status: semaphore.withPermits(1)(statusUnlocked("status")),
+    status: status("status"),
     invokeCommand: (input: PluginCommandInvokeInput) =>
       catalog
         .invoke(input)
         .pipe(
           Effect.ensuring(
             Effect.suspend(() =>
-              failedCommandPlugins.size === 0
+              failedCommands.size === 0
                 ? Effect.void
-                : semaphore.withPermits(1)(retireFailedCommandPlugins),
+                : semaphore.withPermits(1)(retireFailedCommands),
             ),
           ),
         ),
-    enable: (id: string) => semaphore.withPermits(1)(transition("enable", id)),
-    disable: (id: string) => semaphore.withPermits(1)(disableUnlocked(id)),
-    reload: (id: string) => semaphore.withPermits(1)(transition("reload", id)),
+    enable: (id: PluginPackageId) => semaphore.withPermits(1)(transition("enable", id)),
+    disable: (id: PluginPackageId) => semaphore.withPermits(1)(disable(id)),
+    reload: (id: PluginPackageId) => semaphore.withPermits(1)(transition("reload", id)),
     rescan,
   } as const;
 });
+
+/**
+ * Top-level events in `plugins/`. Deleting the folder can leave the watch
+ * attached to the removed folder without an error, so the stream ends as soon
+ * as `plugins/` is no longer the folder it started on.
+ */
+const watchEvents = (fileSystem: FileSystem.FileSystem, directory: string) =>
+  Stream.unwrap(
+    fileSystem.stat(directory).pipe(
+      Effect.map((watched) => {
+        const replaced = fileSystem.stat(directory).pipe(
+          Effect.map(
+            (info) => Option.getOrUndefined(info.ino) !== Option.getOrUndefined(watched.ino),
+          ),
+          Effect.orElseSucceed(() => true),
+        );
+        return fileSystem.watch(directory).pipe(Stream.takeUntilEffect(() => replaced));
+      }),
+    ),
+  );
 
 const unavailableService = (
   error: PluginPackageOperationError,

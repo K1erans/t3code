@@ -1,12 +1,10 @@
 import { it } from "@effect/vitest";
 import { describe, expect } from "vite-plus/test";
-import * as NodeTimersPromises from "node:timers/promises";
 import * as Cause from "effect/Cause";
-import * as Duration from "effect/Duration";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
-import * as Option from "effect/Option";
 
 import * as PluginRuntime from "../src/runtime.ts";
 import type { PluginDefinition, PluginRuntimeSnapshot } from "../src/contract.ts";
@@ -151,11 +149,11 @@ describe("plugin runtime live contributions", () => {
           PluginRuntime.PluginRuntimeReconcileError,
           never
         >("commands", "status", catalog.generation, (handler) => handler())
-        .pipe(Effect.exit, Effect.timeoutOption(Duration.millis(100)));
+        .pipe(Effect.exit);
 
-      expect(Option.isSome(result)).toBe(true);
-      if (Option.isSome(result) && Exit.isFailure(result.value)) {
-        const error = Cause.squash(result.value.cause);
+      expect(Exit.isFailure(result)).toBe(true);
+      if (Exit.isFailure(result)) {
+        const error = Cause.squash(result.cause);
         expect(error).toMatchObject({
           _tag: "PluginRuntimeReentrancyError",
           callback: "contribution",
@@ -175,49 +173,34 @@ describe("plugin runtime live contributions", () => {
           context.register(
             "commands",
             { id: "status", label: "Status" },
-            Effect.promise(async () => {
+            Effect.promise(() =>
               // oxlint-disable-next-line t3code/no-manual-effect-runtime-in-tests -- the regression is specifically a fresh-runtime bridge from plugin code
-              const nested = Effect.runPromiseExit(runtime.reconcile([])).then((exit) => ({
-                exit,
-                kind: "nested" as const,
-              }));
-              const timeout = NodeTimersPromises.setTimeout(50, { kind: "timeout" as const });
-              return Promise.race([nested, timeout]);
-            }),
+              Effect.runPromiseExit(runtime.reconcile([])),
+            ),
           );
         },
       };
       yield* runtime.reconcile([definition]);
       const catalog = yield* runtime.contributions("commands");
 
-      const result = yield* runtime.useContribution(
+      const nested = yield* runtime.useContribution(
         "commands",
         "status",
         catalog.generation,
         (
           handler: Effect.Effect<
-            | { readonly kind: "timeout" }
-            | {
-                readonly exit: Exit.Exit<
-                  PluginRuntimeSnapshot,
-                  PluginRuntime.PluginRuntimeReconcileError
-                >;
-                readonly kind: "nested";
-              }
+            Exit.Exit<PluginRuntimeSnapshot, PluginRuntime.PluginRuntimeReconcileError>
           >,
         ) => handler,
       );
 
-      expect(result.kind).toBe("nested");
-      if (result.kind === "nested") {
-        expect(Exit.isFailure(result.exit)).toBe(true);
-        if (Exit.isFailure(result.exit)) {
-          expect(Cause.squash(result.exit.cause)).toMatchObject({
-            _tag: "PluginRuntimeReentrancyError",
-            callback: "contribution",
-            operation: "reconcile",
-          });
-        }
+      expect(Exit.isFailure(nested)).toBe(true);
+      if (Exit.isFailure(nested)) {
+        expect(Cause.squash(nested.cause)).toMatchObject({
+          _tag: "PluginRuntimeReentrancyError",
+          callback: "contribution",
+          operation: "reconcile",
+        });
       }
     }),
   );
@@ -235,31 +218,82 @@ describe("plugin runtime live contributions", () => {
       yield* runtime.reconcile([definition]);
       const catalog = yield* runtime.contributions("commands");
 
-      const result = yield* runtime.useContribution(
+      const nested = yield* runtime.useContribution(
         "commands",
         "status",
         catalog.generation,
         () => {
           // oxlint-disable-next-line t3code/no-manual-effect-runtime-in-tests -- verifies context before the host callback returns its Effect
-          const nested = Effect.runPromiseExit(runtime.reconcile([])).then((exit) => ({
-            exit,
-            kind: "nested" as const,
-          }));
-          const timeout = NodeTimersPromises.setTimeout(50, { kind: "timeout" as const });
-          return Effect.promise(() => Promise.race([nested, timeout]));
+          const pending = Effect.runPromiseExit(runtime.reconcile([]));
+          return Effect.promise(() => pending);
         },
       );
 
-      expect(result.kind).toBe("nested");
-      if (result.kind === "nested") {
-        expect(Exit.isFailure(result.exit)).toBe(true);
-        if (Exit.isFailure(result.exit)) {
-          expect(Cause.squash(result.exit.cause)).toMatchObject({
-            _tag: "PluginRuntimeReentrancyError",
-            callback: "contribution",
-            operation: "reconcile",
-          });
-        }
+      expect(Exit.isFailure(nested)).toBe(true);
+      if (Exit.isFailure(nested)) {
+        expect(Cause.squash(nested.cause)).toMatchObject({
+          _tag: "PluginRuntimeReentrancyError",
+          callback: "contribution",
+          operation: "reconcile",
+        });
+      }
+    }),
+  );
+
+  it.effect("runs contributions outside the transition lock", () =>
+    Effect.gen(function* () {
+      const runtime = yield* PluginRuntime.make();
+      const release = yield* Deferred.make<void>();
+      // A promise, not a Deferred: a fiber woken from inside the contribution would inherit its
+      // callback context and be treated as reentrant.
+      let markStarted!: () => void;
+      const started = new Promise<void>((resolve) => {
+        markStarted = resolve;
+      });
+      const definition = (version: string): PluginDefinition => ({
+        id: "acme.commands",
+        version,
+        activate(context) {
+          context.register(
+            "commands",
+            { id: "slow", label: "Slow" },
+            Effect.sync(() => markStarted()).pipe(
+              Effect.andThen(Deferred.await(release)),
+              Effect.as(version),
+            ),
+          );
+          context.register("commands", { id: "fast", label: "Fast" }, Effect.succeed(version));
+        },
+      });
+      yield* runtime.reconcile([definition("1.0.0")]);
+      const first = yield* runtime.contributions("commands");
+      const use = (id: string, generation: number) =>
+        runtime.useContribution(
+          "commands",
+          id,
+          generation,
+          (handler: Effect.Effect<string>) => handler,
+        );
+
+      const slow = yield* Effect.forkChild(use("slow", first.generation));
+      yield* Effect.promise(() => started);
+      // Neither another invocation nor a reconcile waits for the running one.
+      expect(yield* use("fast", first.generation)).toBe("1.0.0");
+      yield* runtime.reconcile([definition("2.0.0")]);
+      const second = yield* runtime.contributions("commands");
+      expect(yield* use("fast", second.generation)).toBe("2.0.0");
+
+      // The retired version's invocation still completes.
+      yield* Deferred.succeed(release, undefined);
+      expect(yield* Fiber.join(slow)).toBe("1.0.0");
+
+      yield* runtime.dispose;
+      const afterDispose = yield* Effect.exit(use("fast", second.generation));
+      expect(Exit.isFailure(afterDispose)).toBe(true);
+      if (Exit.isFailure(afterDispose)) {
+        expect(Cause.squash(afterDispose.cause)).toMatchObject({
+          _tag: "PluginRuntimeDisposedError",
+        });
       }
     }),
   );

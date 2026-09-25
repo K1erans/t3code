@@ -35,8 +35,30 @@ const decodeManifestJson = Schema.decodeUnknownEffect(Schema.fromJsonString(Plug
 /** Staging and trash folders; discovery ignores them. */
 export const isHiddenPluginEntry = (entry: string) => entry.startsWith(".");
 
-/** Reads and validates the manifest at the root of a package folder. */
-const readPluginManifest = Effect.fn("PluginInstall.readPluginManifest")(function* (
+/**
+ * The absolute path of a manifest entry point inside `root`, or undefined when
+ * it resolves to the root itself or outside it.
+ */
+export const resolvePackageEntrypoint = (
+  path: Path.Path,
+  root: string,
+  entrypoint: string,
+): string | undefined => {
+  const resolved = path.resolve(root, entrypoint);
+  const relative = path.relative(root, resolved);
+  const escapes =
+    relative === "" ||
+    relative === ".." ||
+    relative.startsWith(`..${path.sep}`) ||
+    path.isAbsolute(relative);
+  return escapes ? undefined : resolved;
+};
+
+/**
+ * Reads and validates the manifest at the root of a package folder. Install and
+ * server discovery share it, so both accept exactly the same packages.
+ */
+export const readPluginManifest = Effect.fn("PluginInstall.readPluginManifest")(function* (
   directory: string,
 ) {
   const fileSystem = yield* FileSystem.FileSystem;
@@ -55,10 +77,14 @@ const readPluginManifest = Effect.fn("PluginInstall.readPluginManifest")(functio
         }),
     ),
   );
-  if (manifest.entrypoints?.server === undefined) {
+  const server = manifest.entrypoints?.server;
+  if (server === undefined) {
     return yield* new PluginInstallError({ detail: "manifest must define entrypoints.server" });
   }
-  return manifest;
+  if (resolvePackageEntrypoint(path, directory, server) === undefined) {
+    return yield* new PluginInstallError({ detail: "entrypoints.server escapes the package" });
+  }
+  return { ...manifest, entrypoints: { ...manifest.entrypoints, server } };
 });
 
 const fail = (detail: string) => (cause: unknown) => new PluginInstallError({ detail, cause });
@@ -67,15 +93,11 @@ const validatePackage = Effect.fn("PluginInstall.validatePackage")(function* (ro
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const manifest = yield* readPluginManifest(root);
-  const entrypoint = path.resolve(root, manifest.entrypoints?.server ?? "");
-  const relative = path.relative(root, entrypoint);
-  if (relative.startsWith("..") || path.isAbsolute(relative)) {
-    return yield* new PluginInstallError({ detail: "entrypoints.server escapes the package" });
-  }
+  const entrypoint = path.resolve(root, manifest.entrypoints.server);
   const exists = yield* fileSystem.exists(entrypoint).pipe(Effect.orElseSucceed(() => false));
   if (!exists) {
     return yield* new PluginInstallError({
-      detail: `entrypoints.server ${manifest.entrypoints?.server} does not exist`,
+      detail: `entrypoints.server ${manifest.entrypoints.server} does not exist`,
     });
   }
   return manifest;
