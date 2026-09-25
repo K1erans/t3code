@@ -2385,6 +2385,10 @@ const makeWsRpcLayer = (
           observeRpcEffect(WS_METHODS.pluginPackagesReload, pluginPackages.reload(input.id), {
             "rpc.aggregate": "pluginPackages",
           }),
+        [WS_METHODS.pluginPackagesRescan]: (_input) =>
+          observeRpcEffect(WS_METHODS.pluginPackagesRescan, pluginPackages.rescan, {
+            "rpc.aggregate": "pluginPackages",
+          }),
         [WS_METHODS.serverRefreshProviders]: (input) =>
           observeRpcEffect(
             WS_METHODS.serverRefreshProviders,

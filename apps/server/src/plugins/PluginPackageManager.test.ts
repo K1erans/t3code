@@ -7,9 +7,13 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Queue from "effect/Queue";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 import { PluginManifest } from "@t3tools/plugin-runtime/manifest";
 
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
@@ -17,6 +21,7 @@ import * as ServerConfig from "../config.ts";
 import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as PluginCommandCatalog from "./PluginCommandCatalog.ts";
+import { installPlugin, removePlugin } from "./PluginInstall.ts";
 import * as PluginPackageManager from "./PluginPackageManager.ts";
 
 const packageId = "com.acme.runtime-status";
@@ -914,5 +919,207 @@ export default function activate(api) {
       );
       Reflect.deleteProperty(globalThis, Symbol.for(gateSymbol));
     }).pipe(Effect.provide(NodeServices.layer)),
+  );
+});
+
+it.layer(NodeServices.layer)("plugin package pickup", (it) => {
+  it.effect("reloads changed enabled packages and reports removed ones as not installed", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3code-plugin-package-rescan-test-",
+      });
+      const pluginsDirectory = `${baseDir}/userdata/plugins`;
+      const disposalFile = `${baseDir}/disposed.log`;
+      const writeSource = Effect.fn(function* (
+        name: string,
+        packageManifest: PluginManifest,
+        source: string,
+      ) {
+        const directory = `${baseDir}/sources/${name}`;
+        yield* fileSystem.makeDirectory(directory, { recursive: true });
+        yield* fileSystem.writeFileString(
+          `${directory}/t3-plugin.json`,
+          encodeManifest(packageManifest),
+        );
+        yield* fileSystem.writeFileString(`${directory}/index.mjs`, source);
+        return directory;
+      });
+      const path = yield* Path.Path;
+      const withFileSystem = <A, E>(
+        effect: Effect.Effect<A, E, FileSystem.FileSystem | Path.Path>,
+      ) =>
+        effect.pipe(
+          Effect.provideService(FileSystem.FileSystem, fileSystem),
+          Effect.provideService(Path.Path, path),
+        );
+      const install = (source: string) =>
+        withFileSystem(installPlugin({ pluginsDirectory, source }));
+      yield* install(yield* writeSource("v1", manifest, pluginSource(disposalFile, "version one")));
+
+      yield* useEnvironment(
+        baseDir,
+        Effect.gen(function* () {
+          const manager = yield* PluginPackageManager.PluginPackageManager;
+          const catalog = yield* PluginCommandCatalog.PluginCommandCatalog;
+          const invoke = Effect.gen(function* () {
+            const listed = yield* catalog.list;
+            return yield* catalog.invoke({ generation: listed.generation, id: commandId });
+          });
+          yield* manager.enable(packageId);
+
+          // Nothing changed, so nothing reloads.
+          yield* manager.rescan;
+          expect(yield* fileSystem.exists(disposalFile)).toBe(false);
+
+          yield* install(
+            yield* writeSource(
+              "v2",
+              { ...manifest, version: "2.0.0" },
+              pluginSource(disposalFile, "version two"),
+            ),
+          );
+          yield* install(
+            yield* writeSource(
+              "other",
+              { ...manifest, id: "com.acme.other", capabilities: [], contributes: {} },
+              "export default () => {};\n",
+            ),
+          );
+          expect(yield* manager.rescan).toMatchObject({
+            packages: [
+              { id: "com.acme.other", enabled: false, state: "disabled" },
+              { id: packageId, version: "2.0.0", enabled: true, state: "active" },
+            ],
+          });
+          expect(yield* invoke).toMatchObject({ message: "version two" });
+
+          yield* withFileSystem(removePlugin({ pluginsDirectory, id: packageId }));
+          const removed = yield* manager.rescan;
+          expect(removed.packages.map((pluginPackage) => pluginPackage.id)).toEqual([
+            "com.acme.other",
+          ]);
+          expect(removed.errors).toContainEqual({ directory: packageId, error: "Not installed" });
+          expect((yield* catalog.list).commands.map((command) => command.id)).not.toContain(
+            commandId,
+          );
+
+          // Reinstalling brings the still-enabled package back.
+          yield* install(`${baseDir}/sources/v2`);
+          expect(yield* manager.rescan).toMatchObject({
+            packages: [{ id: "com.acme.other" }, { id: packageId, state: "active" }],
+          });
+        }),
+      );
+    }),
+  );
+
+  it.effect("reloads in-place code edits and retries failed loads on rescan", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3code-plugin-package-edit-test-",
+      });
+      const packageDirectory = `${baseDir}/userdata/plugins/${packageId}`;
+      const failSymbol = `t3.test.plugin.edit.fail.${baseDir}`;
+      let editTime = 1_767_225_600; // seconds, as utimes expects for numbers
+      // Edits a nested module in place; mtimes are set explicitly so the test never races the clock.
+      const writeMessage = Effect.fn(function* (message: string) {
+        const file = `${packageDirectory}/message.mjs`;
+        yield* fileSystem.writeFileString(
+          file,
+          `if (Reflect.get(globalThis, Symbol.for(${encodeJsonString(failSymbol)}))) throw new Error("not ready");\nexport const message = ${encodeJsonString(message)};\n`,
+        );
+        editTime += 60;
+        yield* fileSystem.utimes(file, editTime, editTime);
+      });
+      yield* fileSystem.makeDirectory(packageDirectory, { recursive: true });
+      yield* fileSystem.writeFileString(
+        `${packageDirectory}/t3-plugin.json`,
+        encodeManifest(manifest),
+      );
+      yield* fileSystem.writeFileString(`${packageDirectory}/index.mjs`, pluginSourceWithHelper);
+      yield* writeMessage("one");
+      // Whole-second times, so a timestamp-preserving copy below matches exactly.
+      for (const entry of ["t3-plugin.json", "index.mjs", ""]) {
+        yield* fileSystem.utimes(`${packageDirectory}/${entry}`, editTime, editTime);
+      }
+
+      yield* useEnvironment(
+        baseDir,
+        Effect.gen(function* () {
+          const manager = yield* PluginPackageManager.PluginPackageManager;
+          const catalog = yield* PluginCommandCatalog.PluginCommandCatalog;
+          const invoke = Effect.gen(function* () {
+            const listed = yield* catalog.list;
+            return yield* catalog.invoke({ generation: listed.generation, id: commandId });
+          });
+          yield* manager.enable(packageId);
+          expect(yield* invoke).toMatchObject({ message: "one" });
+
+          yield* writeMessage("two");
+          yield* manager.rescan;
+          expect(yield* invoke).toMatchObject({ message: "two" });
+
+          // A failed load keeps the previous code and is retried by the next rescan,
+          // even though the folder has not changed since.
+          Reflect.set(globalThis, Symbol.for(failSymbol), true);
+          yield* writeMessage("three");
+          yield* manager.rescan;
+          expect(yield* invoke).toMatchObject({ message: "two" });
+          Reflect.deleteProperty(globalThis, Symbol.for(failSymbol));
+          yield* manager.rescan;
+          expect(yield* invoke).toMatchObject({ message: "three" });
+
+          // A replacement that keeps every size and timestamp, as `cp -a` would.
+          const replacement = `${baseDir}/replacement`;
+          yield* fileSystem.copy(packageDirectory, replacement);
+          const messageSource = yield* fileSystem.readFileString(`${packageDirectory}/message.mjs`);
+          yield* fileSystem.writeFileString(
+            `${replacement}/message.mjs`,
+            messageSource.replace('"three"', '"seven"'),
+          );
+          for (const entry of ["t3-plugin.json", "index.mjs", "message.mjs", ""]) {
+            const original = yield* fileSystem.stat(`${packageDirectory}/${entry}`);
+            const mtime = Option.getOrThrow(original.mtime);
+            yield* fileSystem.utimes(`${replacement}/${entry}`, mtime, mtime);
+          }
+          yield* fileSystem.remove(packageDirectory, { recursive: true });
+          yield* fileSystem.rename(replacement, packageDirectory);
+          yield* manager.rescan;
+          expect(yield* invoke).toMatchObject({ message: "seven" });
+        }),
+      );
+    }),
+  );
+
+  it.effect("rescans once per debounced burst of folder events", () =>
+    Effect.gen(function* () {
+      const events = yield* Queue.unbounded<string>();
+      const rescans = yield* Queue.unbounded<number>();
+      let count = 0;
+      yield* PluginPackageManager.watchPluginsDirectory(
+        Stream.fromQueue(events),
+        // A failing rescan must not end the watch.
+        Effect.suspend(() => Queue.offer(rescans, ++count)).pipe(
+          Effect.andThen(Effect.fail("boom")),
+        ),
+      ).pipe(Effect.forkScoped);
+
+      yield* Queue.offerAll(events, ["a", "b", "c"]);
+      yield* Effect.yieldNow;
+      yield* TestClock.adjust(
+        Duration.subtract(PluginPackageManager.WATCH_DEBOUNCE, Duration.millis(1)),
+      );
+      expect(yield* Queue.size(rescans)).toBe(0);
+      yield* TestClock.adjust(Duration.millis(1));
+      expect(yield* Queue.take(rescans)).toBe(1);
+
+      yield* Queue.offer(events, "d");
+      yield* Effect.yieldNow;
+      yield* TestClock.adjust(PluginPackageManager.WATCH_DEBOUNCE);
+      expect(yield* Queue.take(rescans)).toBe(2);
+      expect(yield* Queue.size(rescans)).toBe(0);
+    }),
   );
 });

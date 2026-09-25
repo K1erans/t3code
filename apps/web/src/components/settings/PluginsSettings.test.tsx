@@ -12,6 +12,7 @@ const atoms = vi.hoisted(() => ({
   enable: Symbol("pluginPackagesEnable"),
   disable: Symbol("pluginPackagesDisable"),
   reload: Symbol("pluginPackagesReload"),
+  rescan: Symbol("pluginPackagesRescan"),
 }));
 
 const query = vi.hoisted(() => ({
@@ -25,6 +26,7 @@ const commands = vi.hoisted(() => ({
   enable: vi.fn(),
   disable: vi.fn(),
   reload: vi.fn(),
+  rescan: vi.fn(),
 }));
 
 const access = vi.hoisted(() => ({
@@ -71,6 +73,7 @@ vi.mock("../../state/server", () => ({
     enablePluginPackage: atoms.enable,
     disablePluginPackage: atoms.disable,
     reloadPluginPackage: atoms.reload,
+    rescanPluginPackages: atoms.rescan,
   },
 }));
 
@@ -78,6 +81,7 @@ vi.mock("../../state/use-atom-command", () => ({
   useAtomCommand: (command: symbol) => {
     if (command === atoms.enable) return commands.enable;
     if (command === atoms.disable) return commands.disable;
+    if (command === atoms.rescan) return commands.rescan;
     return commands.reload;
   },
 }));
@@ -144,6 +148,7 @@ describe("PluginsSettingsPanel", () => {
     commands.enable.mockReset().mockResolvedValue({ _tag: "Success", value: snapshot });
     commands.disable.mockReset().mockResolvedValue({ _tag: "Success", value: snapshot });
     commands.reload.mockReset().mockResolvedValue({ _tag: "Success", value: snapshot });
+    commands.rescan.mockReset().mockResolvedValue({ _tag: "Success", value: snapshot });
   });
 
   it("shows package state, package errors, and environment-scoped actions", () => {
@@ -174,7 +179,7 @@ describe("PluginsSettingsPanel", () => {
     ).not.toBeNull();
   });
 
-  it("routes disable, enable, reload, and refresh to the primary environment", async () => {
+  it("routes disable, enable, and reload to the primary environment", async () => {
     const panel = renderPanel();
     const activeRow = renderPackageRow(panel, "com.acme.active");
     const disabledRow = renderPackageRow(panel, "com.acme.disabled");
@@ -190,15 +195,10 @@ describe("PluginsSettingsPanel", () => {
       activeRow,
       (element) => element.props["aria-label"] === "Reload com.acme.active",
     );
-    const refresh = visitElements(
-      panel,
-      (element) => element.props["aria-label"] === "Refresh plugins",
-    );
 
     (disable?.props.onCheckedChange as ((checked: boolean) => void) | undefined)?.(false);
     (enable?.props.onCheckedChange as ((checked: boolean) => void) | undefined)?.(true);
     (reload?.props.onClick as (() => void) | undefined)?.();
-    (refresh?.props.onClick as (() => void) | undefined)?.();
     await flushPromises();
 
     expect(commands.disable).toHaveBeenCalledWith({
@@ -213,7 +213,7 @@ describe("PluginsSettingsPanel", () => {
       environmentId,
       input: { id: "com.acme.active" },
     });
-    expect(query.refresh).toHaveBeenCalledTimes(4);
+    expect(query.refresh).toHaveBeenCalledTimes(3);
   });
 
   it("keeps an empty environment actionable", () => {
@@ -224,7 +224,7 @@ describe("PluginsSettingsPanel", () => {
       visitElements(panel, (element) => element.props["data-plugin-empty"] === true),
     ).not.toBeNull();
     expect(
-      visitElements(panel, (element) => element.props["aria-label"] === "Refresh plugins"),
+      visitElements(panel, (element) => element.props["aria-label"] === "Rescan plugins"),
     ).not.toBeNull();
   });
 

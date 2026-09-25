@@ -1,3 +1,4 @@
+import * as NodeCrypto from "node:crypto";
 import * as NodeURL from "node:url";
 
 import {
@@ -21,17 +22,19 @@ import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
+import * as Stream from "effect/Stream";
 
 import * as ServerConfig from "../config.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as PluginCommandCatalog from "./PluginCommandCatalog.ts";
 import * as PluginStorage from "./PluginStorage.ts";
+import { isHiddenPluginEntry, MANIFEST_FILE_NAME } from "./PluginInstall.ts";
 
-const MANIFEST_FILE_NAME = "t3-plugin.json";
 const COMMAND_CAPABILITY = "t3.commands@1";
 const MAX_REASON_LENGTH = 2_000;
 const STORAGE_CAPABILITY = "t3.storage@0";
@@ -49,6 +52,7 @@ interface DiscoveryResult {
 interface LoadedDefinition {
   readonly cacheDirectory: string;
   readonly definition: PluginDefinition;
+  readonly fingerprint: string;
   readonly retired: Promise<void>;
 }
 
@@ -230,8 +234,31 @@ export class PluginPackageManager extends Context.Service<
       PluginPackageStatusSnapshot,
       PluginPackageNotFoundError | PluginPackageOperationError
     >;
+    /**
+     * Re-discovers `plugins/`: retires active packages whose folder is gone
+     * and reloads enabled packages whose folder changed since they were last
+     * loaded. New packages simply appear disabled.
+     */
+    readonly rescan: Effect.Effect<PluginPackageStatusSnapshot, PluginPackageOperationError>;
   }
 >()("t3/plugins/PluginPackageManager") {}
+
+/** Long enough to fold the burst of events one install or copy produces. */
+export const WATCH_DEBOUNCE = Duration.millis(250);
+
+/**
+ * Runs `rescan` once per debounced burst of top-level `plugins/` events.
+ * Failures are logged and never stop the watch.
+ */
+export const watchPluginsDirectory = <E, R, RescanError>(
+  events: Stream.Stream<unknown, E, R>,
+  rescan: Effect.Effect<unknown, RescanError>,
+) =>
+  events.pipe(
+    Stream.debounce(WATCH_DEBOUNCE),
+    Stream.runForEach(() => rescan.pipe(Effect.ignoreCause({ log: true }))),
+    Effect.ignoreCause({ log: true }),
+  );
 
 export const make = Effect.fn("PluginPackageManager.make")(function* (
   options: PluginPackageManagerOptions = {},
@@ -259,6 +286,9 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
   const failedCommandPlugins = new Set<string>();
   const entryPointTimeout = Duration.fromInputUnsafe(options.entryPointTimeout ?? "30 seconds");
   const runEntryPoint = Effect.runPromiseWith(yield* Effect.context<never>());
+  // The folder fingerprint each active package was loaded from, so a rescan
+  // reloads only what changed and retries packages that failed to load.
+  const loadedFingerprints = new Map<string, string>();
   let loadSequence = 0;
 
   // The one wrapper around every call into plugin code (activate, commands, dispose).
@@ -306,6 +336,11 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
       });
     };
 
+  // Every file's path, size, mtime and inode: in-place edits change the mtime,
+  // and a replaced folder has new inodes even when a copy preserves timestamps.
+  const fingerprint = (discovered: DiscoveredPackage) =>
+    validatePackageTree(discovered, "rescan").pipe(Effect.orElseSucceed(() => "unknown"));
+
   const removeCacheDirectory = (directory: string) =>
     fileSystem
       .remove(directory, { recursive: true, force: true })
@@ -344,6 +379,7 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
     const pending: Array<readonly [lexical: string, expectedCanonical: string]> = [
       [discovered.directory, path.resolve(canonicalPluginsDirectory, relativeRoot)],
     ];
+    const stamps: Array<string> = [];
     while (pending.length > 0) {
       const current = pending.pop();
       if (current === undefined) continue;
@@ -361,6 +397,15 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
       const info = yield* fileSystem
         .stat(lexical)
         .pipe(Effect.mapError((error) => operationError(operation, error, discovered.manifest.id)));
+      stamps.push(
+        [
+          path.relative(discovered.directory, lexical),
+          info.type,
+          info.size,
+          Option.getOrUndefined(info.mtime)?.getTime(),
+          Option.getOrUndefined(info.ino),
+        ].join(":"),
+      );
       if (info.type !== "Directory") continue;
       const entries = yield* fileSystem
         .readDirectory(lexical)
@@ -369,6 +414,7 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
         pending.push([path.join(lexical, entry), path.join(expectedCanonical, entry)]);
       }
     }
+    return NodeCrypto.createHash("sha256").update(stamps.sort().join("\n")).digest("hex");
   });
 
   const discover = Effect.fn("PluginPackageManager.discover")(function* (
@@ -384,6 +430,7 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
     const errors: Array<PluginPackageDiscoveryError> = [];
 
     for (const entry of [...entries].sort()) {
+      if (isHiddenPluginEntry(entry)) continue;
       const directory = path.join(pluginsDirectory, entry);
       const manifestPath = path.join(directory, MANIFEST_FILE_NAME);
       if (
@@ -427,7 +474,7 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
         discovered.manifest.id,
       );
     }
-    yield* validatePackageTree(discovered, operation);
+    const packageFingerprint = yield* validatePackageTree(discovered, operation);
     const data = discovered.manifest.capabilities.includes(STORAGE_CAPABILITY)
       ? yield* dataAccessFor(discovered.manifest.id, operation)
       : undefined;
@@ -498,6 +545,7 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
         onCommandFailed: () => failedCommandPlugins.add(discovered.manifest.id),
         onRetired: markRetired,
       }),
+      fingerprint: packageFingerprint,
       retired,
     } satisfies LoadedDefinition;
   });
@@ -563,7 +611,7 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
 
     for (const id of [...enabledIds].sort()) {
       if (!discovered.has(id)) {
-        errors.push({ directory: id, error: "enabled package was not discovered" });
+        errors.push({ directory: id, error: "Not installed" });
       }
     }
 
@@ -639,6 +687,7 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
           }
 
           activeDefinitions.set(id, loaded.definition);
+          loadedFingerprints.set(id, loaded.fingerprint);
           activeCacheDirectories.set(id, loaded.cacheDirectory);
           activeManifests.set(id, pluginPackage.manifest);
           activeRetirements.set(id, loaded.retired);
@@ -751,6 +800,53 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
     }),
   );
 
+  const rescanUnlocked = Effect.fn("PluginPackageManager.rescan")(function* () {
+    const discovery = yield* discover("rescan");
+    const enabledIds = yield* readEnabledIds.pipe(
+      Effect.mapError((error) => operationError("rescan", error)),
+    );
+
+    const removed = new Set(
+      [...activeDefinitions.keys()].filter((id) => !discovery.packages.has(id)),
+    );
+    if (removed.size > 0) {
+      const retired = yield* Effect.exit(
+        catalog.reconcile(
+          [...activeDefinitions.values()]
+            .filter((definition) => !removed.has(definition.id))
+            .sort((left, right) => left.id.localeCompare(right.id)),
+        ),
+      );
+      if (retired._tag === "Failure") {
+        const detail = detailFromCause(retired.cause);
+        for (const id of removed) packageErrors.set(id, detail);
+      } else {
+        for (const id of removed) {
+          const cacheDirectory = activeCacheDirectories.get(id);
+          activeDefinitions.delete(id);
+          activeManifests.delete(id);
+          activeCacheDirectories.delete(id);
+          activeRetirements.delete(id);
+          if (cacheDirectory !== undefined) yield* removeCacheDirectory(cacheDirectory);
+        }
+      }
+    }
+
+    for (const id of [...enabledIds].sort()) {
+      const pluginPackage = discovery.packages.get(id);
+      if (pluginPackage === undefined) {
+        // Gone: the status reports it as not installed until it returns.
+        loadedFingerprints.delete(id);
+        if (!activeDefinitions.has(id)) packageErrors.delete(id);
+        continue;
+      }
+      if (loadedFingerprints.get(id) === (yield* fingerprint(pluginPackage))) continue;
+      // A failed reload is recorded against the package and shown in status.
+      yield* Effect.exit(transition("reload", id));
+    }
+    return yield* statusUnlocked("rescan");
+  });
+
   yield* settings.start.pipe(Effect.mapError((error) => operationError("status", error)));
   yield* fileSystem
     .remove(pluginCacheDirectory, { recursive: true, force: true })
@@ -788,6 +884,7 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
           return yield* Effect.failCause(reconciled.cause);
         }
         activeDefinitions.set(id, loaded.definition);
+        loadedFingerprints.set(id, loaded.fingerprint);
         activeCacheDirectories.set(id, loaded.cacheDirectory);
         activeManifests.set(id, pluginPackage.manifest);
         activeRetirements.set(id, loaded.retired);
@@ -817,6 +914,11 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
     ),
   );
 
+  // Forked after the shutdown finalizer so it is interrupted first and cannot
+  // reload anything once shutdown has retired the packages.
+  const rescan = semaphore.withPermits(1)(rescanUnlocked());
+  yield* watchPluginsDirectory(fileSystem.watch(pluginsDirectory), rescan).pipe(Effect.forkScoped);
+
   return {
     status: semaphore.withPermits(1)(statusUnlocked("status")),
     invokeCommand: (input: PluginCommandInvokeInput) =>
@@ -834,6 +936,7 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
     enable: (id: string) => semaphore.withPermits(1)(transition("enable", id)),
     disable: (id: string) => semaphore.withPermits(1)(disableUnlocked(id)),
     reload: (id: string) => semaphore.withPermits(1)(transition("reload", id)),
+    rescan,
   } as const;
 });
 
@@ -847,6 +950,7 @@ const unavailableService = (
     enable: () => Effect.fail(error),
     disable: () => Effect.fail(error),
     reload: () => Effect.fail(error),
+    rescan: Effect.fail(error),
   });
 
 export const layerWith = (options: PluginPackageManagerOptions = {}) =>
