@@ -7,6 +7,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Duration from "effect/Duration";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Schedule from "effect/Schedule";
@@ -734,6 +735,10 @@ it.layer(NodeServices.layer)("plugin package pickup", (it) => {
       );
       yield* fileSystem.writeFileString(`${packageDirectory}/index.mjs`, pluginSourceWithHelper);
       yield* writeMessage("one");
+      // Whole-second times, so a timestamp-preserving copy below matches exactly.
+      for (const entry of ["t3-plugin.json", "index.mjs", ""]) {
+        yield* fileSystem.utimes(`${packageDirectory}/${entry}`, editTime, editTime);
+      }
 
       yield* useEnvironment(
         baseDir,
@@ -760,6 +765,24 @@ it.layer(NodeServices.layer)("plugin package pickup", (it) => {
           Reflect.deleteProperty(globalThis, Symbol.for(failSymbol));
           yield* manager.rescan;
           expect(yield* invoke).toMatchObject({ message: "three" });
+
+          // A replacement that keeps every size and timestamp, as `cp -a` would.
+          const replacement = `${baseDir}/replacement`;
+          yield* fileSystem.copy(packageDirectory, replacement);
+          const messageSource = yield* fileSystem.readFileString(`${packageDirectory}/message.mjs`);
+          yield* fileSystem.writeFileString(
+            `${replacement}/message.mjs`,
+            messageSource.replace('"three"', '"seven"'),
+          );
+          for (const entry of ["t3-plugin.json", "index.mjs", "message.mjs", ""]) {
+            const original = yield* fileSystem.stat(`${packageDirectory}/${entry}`);
+            const mtime = Option.getOrThrow(original.mtime);
+            yield* fileSystem.utimes(`${replacement}/${entry}`, mtime, mtime);
+          }
+          yield* fileSystem.remove(packageDirectory, { recursive: true });
+          yield* fileSystem.rename(replacement, packageDirectory);
+          yield* manager.rescan;
+          expect(yield* invoke).toMatchObject({ message: "seven" });
         }),
       );
     }),

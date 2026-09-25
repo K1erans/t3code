@@ -225,8 +225,8 @@ export const make = Effect.fn("PluginPackageManager.make")(function* () {
   const loadedFingerprints = new Map<string, string>();
   let loadSequence = 0;
 
-  // Every file's path, size and mtime, so in-place code edits are picked up on
-  // the next rescan as well as whole-folder installs.
+  // Every file's path, size, mtime and inode: in-place edits change the mtime,
+  // and a replaced folder has new inodes even when a copy preserves timestamps.
   const fingerprint = (discovered: DiscoveredPackage) =>
     validatePackageTree(discovered, "rescan").pipe(Effect.orElseSucceed(() => "unknown"));
 
@@ -274,6 +274,7 @@ export const make = Effect.fn("PluginPackageManager.make")(function* () {
           info.type,
           info.size,
           Option.getOrUndefined(info.mtime)?.getTime(),
+          Option.getOrUndefined(info.ino),
         ].join(":"),
       );
       if (info.type !== "Directory") continue;
