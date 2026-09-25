@@ -232,8 +232,9 @@ const findInstalled = Effect.fn("PluginInstall.findInstalled")(function* (
 });
 
 /**
- * Renames every folder holding `id` into a scoped trash folder, which is
- * deleted with the scope. Returns an effect that puts them back.
+ * Renames every folder holding `id` into a hidden trash folder. `restore` puts
+ * them back and `discard` deletes them. If a restore fails the trash is kept,
+ * and the error names it, so a failed update never loses the old copy.
  */
 const moveAside = Effect.fn("PluginInstall.moveAside")(function* (
   pluginsDirectory: string,
@@ -242,27 +243,37 @@ const moveAside = Effect.fn("PluginInstall.moveAside")(function* (
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const existing = yield* findInstalled(pluginsDirectory, id);
-  if (existing.length === 0) return { moved: [] as ReadonlyArray<string>, restore: Effect.void };
+  if (existing.length === 0) {
+    return { moved: [] as ReadonlyArray<string>, restore: Effect.void, discard: Effect.void };
+  }
   const trash = yield* fileSystem
-    .makeTempDirectoryScoped({ directory: pluginsDirectory, prefix: ".trash-" })
+    .makeTempDirectory({ directory: pluginsDirectory, prefix: ".trash-" })
     .pipe(Effect.mapError(fail(`Could not write to ${pluginsDirectory}`)));
   const moved: Array<string> = [];
-  const restore = Effect.forEach(
-    moved,
-    (entry) =>
-      fileSystem
-        .rename(path.join(trash, entry), path.join(pluginsDirectory, entry))
-        .pipe(Effect.ignore),
-    { discard: true },
-  );
+  const discard = fileSystem.remove(trash, { recursive: true }).pipe(Effect.ignore);
+  const restore = Effect.gen(function* () {
+    const stranded: Array<string> = [];
+    for (const entry of moved) {
+      const restored = yield* Effect.exit(
+        fileSystem.rename(path.join(trash, entry), path.join(pluginsDirectory, entry)),
+      );
+      if (restored._tag === "Failure") stranded.push(entry);
+    }
+    if (stranded.length > 0) {
+      return yield* new PluginInstallError({
+        detail: `Could not restore ${stranded.join(", ")}; the previous copy is kept in ${trash}`,
+      });
+    }
+    yield* discard;
+  });
   for (const entry of existing) {
     yield* fileSystem.rename(path.join(pluginsDirectory, entry), path.join(trash, entry)).pipe(
       Effect.mapError(fail(`Could not move ${entry} out of ${pluginsDirectory}`)),
-      Effect.onError(() => restore),
+      Effect.catch((error) => restore.pipe(Effect.andThen(Effect.fail(error)))),
     );
     moved.push(entry);
   }
-  return { moved, restore };
+  return { moved, restore, discard };
 });
 
 export interface InstalledPlugin {
@@ -332,8 +343,9 @@ export const installPlugin = Effect.fn("PluginInstall.installPlugin")(function* 
       const aside = yield* moveAside(input.pluginsDirectory, manifest.id);
       yield* fileSystem.rename(root, destination).pipe(
         Effect.mapError(fail(`Could not install into ${destination}`)),
-        Effect.onError(() => aside.restore),
+        Effect.catch((error) => aside.restore.pipe(Effect.andThen(Effect.fail(error)))),
       );
+      yield* aside.discard;
       return {
         manifest,
         directory: destination,
@@ -348,9 +360,10 @@ export const removePlugin = Effect.fn("PluginInstall.removePlugin")(function* (i
   readonly pluginsDirectory: string;
   readonly id: string;
 }) {
-  const removed = yield* Effect.scoped(moveAside(input.pluginsDirectory, input.id));
+  const removed = yield* moveAside(input.pluginsDirectory, input.id);
   if (removed.moved.length === 0) {
     return yield* new PluginInstallError({ detail: `Plugin ${input.id} is not installed.` });
   }
+  yield* removed.discard;
   return removed.moved;
 });

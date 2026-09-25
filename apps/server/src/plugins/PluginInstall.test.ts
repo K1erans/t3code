@@ -5,6 +5,7 @@ import { it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
+import * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
 import { PluginManifest } from "@t3tools/plugin-runtime/manifest";
 import { expect } from "vite-plus/test";
@@ -151,6 +152,47 @@ it.layer(NodeServices.layer)("plugin install", (it) => {
 
       expect(exit._tag).toBe("Failure");
       expect(yield* installedVersions).toEqual({ [pluginId]: "1.0.0" });
+    }),
+  );
+
+  it.effect("keeps the previous copy when an update and its rollback both fail", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const { pluginsDirectory, writePackage } = yield* setup();
+      yield* installPlugin({ pluginsDirectory, source: yield* writePackage("v1", "1.0.0") });
+      const destination = path.join(pluginsDirectory, pluginId);
+      // Something else holds the destination, so neither the new nor the old copy can land there.
+      const blockedFileSystem: FileSystem.FileSystem = {
+        ...fileSystem,
+        rename: (from, to) =>
+          to === destination
+            ? Effect.fail(
+                PlatformError.systemError({
+                  _tag: "AlreadyExists",
+                  module: "FileSystem",
+                  method: "rename",
+                  pathOrDescriptor: to,
+                }),
+              )
+            : fileSystem.rename(from, to),
+      };
+
+      const error = yield* Effect.flip(
+        installPlugin({ pluginsDirectory, source: yield* writePackage("v2", "2.0.0") }).pipe(
+          Effect.provideService(FileSystem.FileSystem, blockedFileSystem),
+        ),
+      );
+
+      expect(error.detail).toContain("the previous copy is kept in");
+      const trash = (yield* fileSystem.readDirectory(pluginsDirectory)).filter((entry) =>
+        entry.startsWith(".trash-"),
+      );
+      expect(trash).toHaveLength(1);
+      const kept = yield* fileSystem.readFileString(
+        path.join(pluginsDirectory, trash[0] ?? "", pluginId, "t3-plugin.json"),
+      );
+      expect(decodeVersion(kept).version).toBe("1.0.0");
     }),
   );
 

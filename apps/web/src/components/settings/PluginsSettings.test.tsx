@@ -179,7 +179,7 @@ describe("PluginsSettingsPanel", () => {
     ).not.toBeNull();
   });
 
-  it("routes disable, enable, reload, and rescan to the primary environment", async () => {
+  it("routes disable, enable, and reload to the primary environment", async () => {
     const panel = renderPanel();
     const activeRow = renderPackageRow(panel, "com.acme.active");
     const disabledRow = renderPackageRow(panel, "com.acme.disabled");
@@ -195,15 +195,10 @@ describe("PluginsSettingsPanel", () => {
       activeRow,
       (element) => element.props["aria-label"] === "Reload com.acme.active",
     );
-    const rescan = visitElements(
-      panel,
-      (element) => element.props["aria-label"] === "Rescan plugins",
-    );
 
     (disable?.props.onCheckedChange as ((checked: boolean) => void) | undefined)?.(false);
     (enable?.props.onCheckedChange as ((checked: boolean) => void) | undefined)?.(true);
     (reload?.props.onClick as (() => void) | undefined)?.();
-    (rescan?.props.onClick as (() => void) | undefined)?.();
     await flushPromises();
 
     expect(commands.disable).toHaveBeenCalledWith({
@@ -218,8 +213,7 @@ describe("PluginsSettingsPanel", () => {
       environmentId,
       input: { id: "com.acme.active" },
     });
-    expect(commands.rescan).toHaveBeenCalledWith({ environmentId, input: {} });
-    expect(query.refresh).toHaveBeenCalledTimes(4);
+    expect(query.refresh).toHaveBeenCalledTimes(3);
   });
 
   it("keeps an empty environment actionable", () => {
