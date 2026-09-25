@@ -604,9 +604,20 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
     const loaded = yield* Effect.exit(
       Effect.gen(function* () {
         const moduleUrl = NodeURL.pathToFileURL(entrypointPath);
+        // A module whose top-level code never settles would otherwise hold the manager
+        // lock forever. The import cannot be cancelled: timing out only stops waiting.
         const module = yield* Effect.tryPromise(
           () => import(/* @vite-ignore */ moduleUrl.href) as Promise<Record<string, unknown>>,
-        ).pipe(Effect.catch(failOperation(operation, id)));
+        ).pipe(
+          Effect.timeoutOrElse({
+            duration: entryPointTimeout,
+            orElse: () =>
+              Effect.fail(
+                `import timed out: did not finish within ${Duration.format(entryPointTimeout)}`,
+              ),
+          }),
+          Effect.catch(failOperation(operation, id)),
+        );
         if (typeof module.default !== "function") {
           return yield* operationError(
             operation,

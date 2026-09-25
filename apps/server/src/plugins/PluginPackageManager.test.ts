@@ -861,10 +861,13 @@ const startedHook = (baseDir: string) =>
     ({ symbol }) => Effect.sync(() => Reflect.deleteProperty(globalThis, Symbol.for(symbol))),
   );
 
-/** Runs `effect` until plugin code has started, then lets the entry point timeout elapse. */
+/**
+ * Runs `effect` until plugin code has started, then lets the entry point timeout
+ * elapse, and completes with `effect`'s own result.
+ */
 const runPastTimeout = <A, E, R>(effect: Effect.Effect<A, E, R>, started: Promise<void>) =>
   Effect.gen(function* () {
-    const fiber = yield* Effect.forkChild(Effect.exit(effect));
+    const fiber = yield* Effect.forkChild(effect);
     yield* Effect.promise(() => started);
     yield* TestClock.adjust(entryPointTimeout);
     return yield* Fiber.join(fiber);
@@ -927,7 +930,9 @@ it.layer(NodeServices.layer)("plugin failure containment", (it) => {
             const manager = yield* PluginPackageManager.PluginPackageManager;
             const catalog = yield* PluginCommandCatalog.PluginCommandCatalog;
             yield* manager.enable(healthyPackageId);
-            const enabled = yield* runPastTimeout(manager.enable(packageId), hook.started);
+            const enabled = yield* Effect.exit(
+              runPastTimeout(manager.enable(packageId), hook.started),
+            );
             expect(enabled._tag).toBe("Failure");
 
             const status = yield* manager.status;
@@ -978,7 +983,7 @@ it.layer(NodeServices.layer)("plugin failure containment", (it) => {
             const listed = yield* catalog.list;
 
             const failure = yield* Effect.flip(
-              yield* runPastTimeout(
+              runPastTimeout(
                 manager.invokeCommand({ generation: listed.generation, id: commandId }),
                 hook.started,
               ),
@@ -1021,6 +1026,39 @@ it.layer(NodeServices.layer)("plugin failure containment", (it) => {
       }),
     );
   }
+
+  it.effect("fails a package whose import does not finish within the entry point timeout", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3code-plugin-import-timeout-test-",
+      });
+      const hook = yield* startedHook(baseDir);
+      // Top-level code that never settles.
+      yield* writePackage(
+        baseDir,
+        packageId,
+        commandId,
+        `${hook.call}\nawait new Promise(() => {});\nexport default function activate() {}\n`,
+      );
+
+      yield* useEnvironment(
+        baseDir,
+        Effect.gen(function* () {
+          const manager = yield* PluginPackageManager.PluginPackageManager;
+          const failure = yield* Effect.flip(
+            runPastTimeout(manager.enable(packageId), hook.started),
+          );
+          const reason = "import timed out: did not finish within 50ms";
+          expect(failure.message).toContain(reason);
+          expect((yield* manager.status).packages).toMatchObject([
+            { id: packageId, enabled: false, state: "error", error: reason },
+          ]);
+        }),
+        { entryPointTimeout },
+      );
+    }),
+  );
 
   it.effect("drops a retired plugin from status once its folder is removed", () =>
     Effect.gen(function* () {
@@ -1104,50 +1142,55 @@ it.layer(NodeServices.layer)("plugin failure containment", (it) => {
     }),
   );
 
-  it.effect("retires the previous version after its running command fails, keeping the reload", () =>
-    Effect.gen(function* () {
-      const fileSystem = yield* FileSystem.FileSystem;
-      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
-        prefix: "t3code-plugin-late-failure-test-",
-      });
-      const gateSymbol = `t3.test.plugin.late-failure.${baseDir}`;
-      const { gate, started } = yield* makeGate(gateSymbol);
-      yield* writePackage(baseDir, packageId, commandId, gatedCommandSource(gateSymbol));
+  it.effect(
+    "retires the previous version after its running command fails, keeping the reload",
+    () =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+          prefix: "t3code-plugin-late-failure-test-",
+        });
+        const gateSymbol = `t3.test.plugin.late-failure.${baseDir}`;
+        const { gate, started } = yield* makeGate(gateSymbol);
+        yield* writePackage(baseDir, packageId, commandId, gatedCommandSource(gateSymbol));
 
-      yield* useEnvironment(
-        baseDir,
-        Effect.gen(function* () {
-          const manager = yield* PluginPackageManager.PluginPackageManager;
-          const catalog = yield* PluginCommandCatalog.PluginCommandCatalog;
-          yield* manager.enable(packageId);
-          const invoking = yield* Effect.forkChild(
-            manager.invokeCommand({ generation: (yield* catalog.list).generation, id: commandId }),
-          );
-          yield* Effect.promise(() => started);
+        yield* useEnvironment(
+          baseDir,
+          Effect.gen(function* () {
+            const manager = yield* PluginPackageManager.PluginPackageManager;
+            const catalog = yield* PluginCommandCatalog.PluginCommandCatalog;
+            yield* manager.enable(packageId);
+            const invoking = yield* Effect.forkChild(
+              manager.invokeCommand({
+                generation: (yield* catalog.list).generation,
+                id: commandId,
+              }),
+            );
+            yield* Effect.promise(() => started);
 
-          // Status does not wait for the slow command. A reload does: it disposes the
-          // previous version only once the command running on it finishes.
-          expect((yield* manager.status).packages).toMatchObject([
-            { id: packageId, state: "active" },
-          ]);
-          const reloading = yield* Effect.forkChild(manager.reload(packageId));
-          yield* Effect.yieldNow;
-          gate.reject(new Error("late"));
-          expect((yield* Fiber.await(invoking))._tag).toBe("Failure");
-          yield* Fiber.join(reloading);
+            // Status does not wait for the slow command. A reload does: it disposes the
+            // previous version only once the command running on it finishes.
+            expect((yield* manager.status).packages).toMatchObject([
+              { id: packageId, state: "active" },
+            ]);
+            const reloading = yield* Effect.forkChild(manager.reload(packageId));
+            yield* Effect.yieldNow;
+            gate.reject(new Error("late"));
+            expect((yield* Fiber.await(invoking))._tag).toBe("Failure");
+            yield* Fiber.join(reloading);
 
-          const status = yield* manager.status;
-          expect(status.packages).toMatchObject([{ id: packageId, state: "active" }]);
-          expect(status.packages[0]?.error).toBeUndefined();
-          expect(
-            yield* manager.invokeCommand({
-              generation: (yield* catalog.list).generation,
-              id: commandId,
-            }),
-          ).toEqual({ message: "reloaded", tone: "success" });
-        }),
-      );
-    }),
+            const status = yield* manager.status;
+            expect(status.packages).toMatchObject([{ id: packageId, state: "active" }]);
+            expect(status.packages[0]?.error).toBeUndefined();
+            expect(
+              yield* manager.invokeCommand({
+                generation: (yield* catalog.list).generation,
+                id: commandId,
+              }),
+            ).toEqual({ message: "reloaded", tone: "success" });
+          }),
+        );
+      }),
   );
 });
 
