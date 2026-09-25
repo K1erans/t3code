@@ -1,4 +1,4 @@
-import type { PluginPackageStatus } from "@t3tools/contracts";
+import type { PluginPackageStatus, PluginPackageStatusSnapshot } from "@t3tools/contracts";
 import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
@@ -28,7 +28,11 @@ import { Switch } from "../ui/switch";
 import { toastManager } from "../ui/toast";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { useEnvironmentOperateAccess } from "./EnvironmentIconPicker";
-import { filterPluginPackages, pluginStatusBadges } from "./PluginsSettings.logic";
+import {
+  filterPluginPackages,
+  pluginActionErrorText,
+  pluginStatusBadges,
+} from "./PluginsSettings.logic";
 import { useSettingsScope } from "./SettingsScopeContext";
 import { SettingsScopeNotice } from "./SettingsScopeNotice";
 import { SettingsPageContainer, SettingsRow, SettingsSection } from "./settingsLayout";
@@ -37,8 +41,10 @@ import { searchableSetting } from "./settingsSearch";
 type PackageAction = "enable" | "disable" | "reload";
 
 function actionFailureMessage(action: PackageAction, error: unknown): string {
-  if (error instanceof Error && error.message.trim().length > 0) return error.message;
-  return `The plugin could not be ${action === "reload" ? "reloaded" : `${action}d`}.`;
+  return (
+    pluginActionErrorText(error) ??
+    `The plugin could not be ${action === "reload" ? "reloaded" : `${action}d`}.`
+  );
 }
 
 function PluginPackageRow({
@@ -180,15 +186,26 @@ function EnvironmentPluginsSettings({
     readonly action: PackageAction;
   } | null>(null);
   const [query, setQuery] = useState("");
+  // Actions return a fresh status snapshot. The query atom is read-only, so
+  // hold the newest action snapshot here rather than refetching, which would
+  // repeat the server's discovery scan. A newer query result replaces it.
+  const [actionSnapshot, setActionSnapshot] = useState<{
+    readonly snapshot: PluginPackageStatusSnapshot;
+    readonly receivedAt: number;
+  } | null>(null);
+  const snapshot =
+    actionSnapshot !== null && actionSnapshot.receivedAt > (status.dataUpdatedAt ?? 0)
+      ? actionSnapshot.snapshot
+      : status.data;
   const packages = useMemo(
     () =>
-      [...(status.data?.packages ?? [])].sort(
+      [...(snapshot?.packages ?? [])].sort(
         (left, right) => left.name.localeCompare(right.name) || left.id.localeCompare(right.id),
       ),
-    [status.data?.packages],
+    [snapshot?.packages],
   );
   const visiblePackages = useMemo(() => filterPluginPackages(packages, query), [packages, query]);
-  const discoveryErrors = status.data?.errors ?? [];
+  const discoveryErrors = snapshot?.errors ?? [];
 
   const runAction = useCallback(
     (pluginPackage: PluginPackageStatus, action: PackageAction) => {
@@ -203,9 +220,11 @@ function EnvironmentPluginsSettings({
         });
         setPending(null);
         if (result._tag === "Success") {
-          status.refresh();
+          setActionSnapshot({ snapshot: result.value, receivedAt: Date.now() });
           return;
         }
+        // The server records the failure on the plugin's row; refetch to show it.
+        status.refresh();
         if (!isAtomCommandInterrupted(result)) {
           const error = squashAtomCommandFailure(result);
           toastManager.add({
@@ -231,14 +250,18 @@ function EnvironmentPluginsSettings({
     void (async () => {
       const result = await rescanPlugins({ environmentId, input: {} });
       setRescanning(false);
+      if (result._tag === "Success") {
+        setActionSnapshot({ snapshot: result.value, receivedAt: Date.now() });
+        return;
+      }
       status.refresh();
-      if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
-        const error = squashAtomCommandFailure(result);
+      if (!isAtomCommandInterrupted(result)) {
         toastManager.add({
           type: "error",
           title: "Could not rescan plugins",
           description:
-            error instanceof Error ? error.message : "The plugins folder could not be read.",
+            pluginActionErrorText(squashAtomCommandFailure(result)) ??
+            "The plugins folder could not be read.",
         });
       }
     })();
@@ -310,7 +333,7 @@ function EnvironmentPluginsSettings({
           </Alert>
         ) : null}
 
-        {status.isPending && status.data === null ? (
+        {status.isPending && snapshot === null ? (
           <Empty size="compact">
             <Spinner className="size-4" />
             <EmptyDescription>Loading plugins</EmptyDescription>

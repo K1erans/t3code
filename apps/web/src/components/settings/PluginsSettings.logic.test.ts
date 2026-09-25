@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { filterPluginPackages, pluginStatusBadges } from "./PluginsSettings.logic";
+import { PluginPackageOperationError } from "@t3tools/contracts";
+
+import {
+  filterPluginPackages,
+  pluginActionErrorText,
+  pluginStatusBadges,
+} from "./PluginsSettings.logic";
 
 describe("pluginStatusBadges", () => {
   it("labels each lifecycle state", () => {
@@ -48,5 +54,25 @@ describe("filterPluginPackages", () => {
       "com.acme.task-board",
     ]);
     expect(filterPluginPackages(packages, "acme missing")).toEqual([]);
+  });
+});
+
+describe("pluginActionErrorText", () => {
+  it("prefers the operation detail over the generic message", () => {
+    const error = new PluginPackageOperationError({
+      id: "acme.tools",
+      operation: "enable",
+      detail: "activate() threw: missing API key",
+      cause: new Error("stack-bearing cause"),
+    });
+    expect(pluginActionErrorText(error)).toBe("activate() threw: missing API key");
+  });
+
+  it("falls back to the message, then to nothing", () => {
+    expect(pluginActionErrorText(new PluginPackageOperationError({ operation: "rescan" }))).toBe(
+      "rescan failed for plugin packages",
+    );
+    expect(pluginActionErrorText(new Error("  "))).toBeNull();
+    expect(pluginActionErrorText("boom")).toBeNull();
   });
 });

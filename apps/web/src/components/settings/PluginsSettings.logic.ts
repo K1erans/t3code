@@ -41,3 +41,17 @@ export function filterPluginPackages<
     return terms.every((term) => haystack.includes(term));
   });
 }
+
+/**
+ * The most specific readable text for a failed plugin action: the server's
+ * `detail` on a PluginPackageOperationError, else the error message, else null.
+ * Never the raw cause or stack.
+ */
+export function pluginActionErrorText(error: unknown): string | null {
+  if (typeof error !== "object" || error === null) return null;
+  if ("detail" in error && typeof error.detail === "string" && error.detail.trim().length > 0) {
+    return error.detail;
+  }
+  if (error instanceof Error && error.message.trim().length > 0) return error.message;
+  return null;
+}
