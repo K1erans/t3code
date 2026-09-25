@@ -1122,6 +1122,12 @@ export function createServerEnvironmentAtoms<R, E>(
       scheduler: pluginPackageScheduler,
       concurrency: configConcurrency,
     }),
+    rescanPluginPackages: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:rescan-plugin-packages",
+      tag: WS_METHODS.pluginPackagesRescan,
+      scheduler: pluginPackageScheduler,
+      concurrency: configConcurrency,
+    }),
     updateProvider: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:server:update-provider",
       tag: WS_METHODS.serverUpdateProvider,

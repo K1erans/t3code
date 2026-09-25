@@ -71,6 +71,7 @@ export const RPC_REQUIRED_SCOPES = {
   [WS_METHODS.pluginPackagesEnable]: AuthOrchestrationOperateScope,
   [WS_METHODS.pluginPackagesDisable]: AuthOrchestrationOperateScope,
   [WS_METHODS.pluginPackagesReload]: AuthOrchestrationOperateScope,
+  [WS_METHODS.pluginPackagesRescan]: AuthOrchestrationOperateScope,
   [WS_METHODS.subscribePluginCommands]: AuthOrchestrationReadScope,
   [WS_METHODS.cloudGetRelayClientStatus]: AuthRelayReadScope,
   [WS_METHODS.cloudInstallRelayClient]: AuthRelayWriteScope,

@@ -16,18 +16,21 @@ import {
 } from "@t3tools/plugin-runtime/manifest";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
+import * as Stream from "effect/Stream";
 
 import * as ServerConfig from "../config.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as PluginCommandCatalog from "./PluginCommandCatalog.ts";
+import { isHiddenPluginEntry, MANIFEST_FILE_NAME } from "./PluginInstall.ts";
 
-const MANIFEST_FILE_NAME = "t3-plugin.json";
 const COMMAND_CAPABILITY = "t3.commands@1";
 
 interface DiscoveredPackage {
@@ -175,8 +178,31 @@ export class PluginPackageManager extends Context.Service<
       PluginPackageStatusSnapshot,
       PluginPackageNotFoundError | PluginPackageOperationError
     >;
+    /**
+     * Re-discovers `plugins/`: retires active packages whose folder is gone
+     * and reloads enabled packages whose folder changed since they were last
+     * loaded. New packages simply appear disabled.
+     */
+    readonly rescan: Effect.Effect<PluginPackageStatusSnapshot, PluginPackageOperationError>;
   }
 >()("t3/plugins/PluginPackageManager") {}
+
+/** Long enough to fold the burst of events one install or copy produces. */
+export const WATCH_DEBOUNCE = Duration.millis(250);
+
+/**
+ * Runs `rescan` once per debounced burst of top-level `plugins/` events.
+ * Failures are logged and never stop the watch.
+ */
+export const watchPluginsDirectory = <E, R, RescanError>(
+  events: Stream.Stream<unknown, E, R>,
+  rescan: Effect.Effect<unknown, RescanError>,
+) =>
+  events.pipe(
+    Stream.debounce(WATCH_DEBOUNCE),
+    Stream.runForEach(() => rescan.pipe(Effect.ignoreCause({ log: true }))),
+    Effect.ignoreCause({ log: true }),
+  );
 
 export const make = Effect.fn("PluginPackageManager.make")(function* () {
   const fileSystem = yield* FileSystem.FileSystem;
@@ -192,7 +218,31 @@ export const make = Effect.fn("PluginPackageManager.make")(function* () {
   const activeManifests = new Map<string, PluginManifestType>();
   const activeRetirements = new Map<string, Promise<void>>();
   const packageErrors = new Map<string, string>();
+  // The folder fingerprint each enabled package was last loaded from, success
+  // or not, so a rescan reloads only what actually changed.
+  const loadedFingerprints = new Map<string, string>();
   let loadSequence = 0;
+
+  // Installs and removals rename whole folders, so the folder and manifest
+  // identities change whenever a package is replaced.
+  const fingerprint = (discovered: DiscoveredPackage) =>
+    Effect.all([
+      fileSystem.stat(discovered.directory),
+      fileSystem.stat(path.join(discovered.directory, MANIFEST_FILE_NAME)),
+    ]).pipe(
+      Effect.map((infos) =>
+        infos
+          .map((info) =>
+            [
+              Option.getOrUndefined(info.ino),
+              Option.getOrUndefined(info.mtime)?.getTime(),
+              info.size,
+            ].join(":"),
+          )
+          .join("/"),
+      ),
+      Effect.orElseSucceed(() => "unknown"),
+    );
 
   const removeCacheDirectory = (directory: string) =>
     fileSystem
@@ -254,6 +304,7 @@ export const make = Effect.fn("PluginPackageManager.make")(function* () {
     const errors: Array<PluginPackageDiscoveryError> = [];
 
     for (const entry of [...entries].sort()) {
+      if (isHiddenPluginEntry(entry)) continue;
       const directory = path.join(pluginsDirectory, entry);
       const manifestPath = path.join(directory, MANIFEST_FILE_NAME);
       if (
@@ -289,6 +340,7 @@ export const make = Effect.fn("PluginPackageManager.make")(function* () {
     discovered: DiscoveredPackage,
     operation: PluginPackageOperation,
   ) {
+    loadedFingerprints.set(discovered.manifest.id, yield* fingerprint(discovered));
     const serverEntrypoint = discovered.manifest.entrypoints.server;
     if (serverEntrypoint === undefined) {
       return yield* operationError(
@@ -427,7 +479,7 @@ export const make = Effect.fn("PluginPackageManager.make")(function* () {
 
     for (const id of [...enabledIds].sort()) {
       if (!discovered.has(id)) {
-        errors.push({ directory: id, error: "enabled package was not discovered" });
+        errors.push({ directory: id, error: "Not installed" });
       }
     }
 
@@ -576,6 +628,53 @@ export const make = Effect.fn("PluginPackageManager.make")(function* () {
     ),
   );
 
+  const rescanUnlocked = Effect.fn("PluginPackageManager.rescan")(function* () {
+    const discovery = yield* discover("rescan");
+    const enabledIds = yield* readEnabledIds.pipe(
+      Effect.mapError((error) => operationError("rescan", error)),
+    );
+
+    const removed = new Set(
+      [...activeDefinitions.keys()].filter((id) => !discovery.packages.has(id)),
+    );
+    if (removed.size > 0) {
+      const retired = yield* Effect.exit(
+        catalog.reconcile(
+          [...activeDefinitions.values()]
+            .filter((definition) => !removed.has(definition.id))
+            .sort((left, right) => left.id.localeCompare(right.id)),
+        ),
+      );
+      if (retired._tag === "Failure") {
+        const detail = detailFromCause(retired.cause);
+        for (const id of removed) packageErrors.set(id, detail);
+      } else {
+        for (const id of removed) {
+          const cacheDirectory = activeCacheDirectories.get(id);
+          activeDefinitions.delete(id);
+          activeManifests.delete(id);
+          activeCacheDirectories.delete(id);
+          activeRetirements.delete(id);
+          if (cacheDirectory !== undefined) yield* removeCacheDirectory(cacheDirectory);
+        }
+      }
+    }
+
+    for (const id of [...enabledIds].sort()) {
+      const pluginPackage = discovery.packages.get(id);
+      if (pluginPackage === undefined) {
+        // Gone: the status reports it as not installed until it returns.
+        loadedFingerprints.delete(id);
+        if (!activeDefinitions.has(id)) packageErrors.delete(id);
+        continue;
+      }
+      if (loadedFingerprints.get(id) === (yield* fingerprint(pluginPackage))) continue;
+      // A failed reload is recorded against the package and shown in status.
+      yield* Effect.exit(transition("reload", id));
+    }
+    return yield* statusUnlocked("rescan");
+  });
+
   yield* settings.start.pipe(Effect.mapError((error) => operationError("status", error)));
   yield* fileSystem
     .remove(pluginCacheDirectory, { recursive: true, force: true })
@@ -642,11 +741,17 @@ export const make = Effect.fn("PluginPackageManager.make")(function* () {
     ),
   );
 
+  // Forked after the shutdown finalizer so it is interrupted first and cannot
+  // reload anything once shutdown has retired the packages.
+  const rescan = semaphore.withPermits(1)(rescanUnlocked());
+  yield* watchPluginsDirectory(fileSystem.watch(pluginsDirectory), rescan).pipe(Effect.forkScoped);
+
   return {
     status: semaphore.withPermits(1)(statusUnlocked("status")),
     enable: (id: string) => semaphore.withPermits(1)(transition("enable", id)),
     disable: (id: string) => semaphore.withPermits(1)(disableUnlocked(id)),
     reload: (id: string) => semaphore.withPermits(1)(transition("reload", id)),
+    rescan,
   } as const;
 });
 
@@ -656,6 +761,7 @@ const unavailableService = (error: PluginPackageOperationError) =>
     enable: () => Effect.fail(error),
     disable: () => Effect.fail(error),
     reload: () => Effect.fail(error),
+    rescan: Effect.fail(error),
   });
 
 export const layer = Layer.effect(

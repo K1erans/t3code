@@ -409,6 +409,7 @@ export const WS_METHODS = {
   pluginPackagesEnable: "pluginPackages.enable",
   pluginPackagesDisable: "pluginPackages.disable",
   pluginPackagesReload: "pluginPackages.reload",
+  pluginPackagesRescan: "pluginPackages.rescan",
 
   // Cloud environment methods
   cloudGetRelayClientStatus: "cloud.getRelayClientStatus",
@@ -531,6 +532,12 @@ const pluginPackageActionRpc = <const Method extends string>(method: Method) =>
 export const WsPluginPackagesEnableRpc = pluginPackageActionRpc(WS_METHODS.pluginPackagesEnable);
 export const WsPluginPackagesDisableRpc = pluginPackageActionRpc(WS_METHODS.pluginPackagesDisable);
 export const WsPluginPackagesReloadRpc = pluginPackageActionRpc(WS_METHODS.pluginPackagesReload);
+
+export const WsPluginPackagesRescanRpc = Rpc.make(WS_METHODS.pluginPackagesRescan, {
+  payload: Schema.Struct({}),
+  success: PluginPackageStatusSnapshot,
+  error: Schema.Union([PluginPackageOperationError, EnvironmentAuthorizationError]),
+});
 
 const WsServerRefreshProvidersRpc = Rpc.make(WS_METHODS.serverRefreshProviders, {
   payload: Schema.Struct({
@@ -1470,6 +1477,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsPluginPackagesEnableRpc,
   WsPluginPackagesDisableRpc,
   WsPluginPackagesReloadRpc,
+  WsPluginPackagesRescanRpc,
   WsServerRefreshProvidersRpc,
   WsServerUpdateProviderRpc,
   WsProviderConsumeResetCreditRpc,

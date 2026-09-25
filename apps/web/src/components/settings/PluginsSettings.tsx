@@ -141,6 +141,10 @@ export function PluginsSettingsPanel() {
   const reloadPlugin = useAtomCommand(serverEnvironment.reloadPluginPackage, {
     reportFailure: false,
   });
+  const rescanPlugins = useAtomCommand(serverEnvironment.rescanPluginPackages, {
+    reportFailure: false,
+  });
+  const [rescanning, setRescanning] = useState(false);
   const [pending, setPending] = useState<{
     readonly id: string;
     readonly action: PackageAction;
@@ -179,6 +183,31 @@ export function PluginsSettingsPanel() {
     [disablePlugin, enablePlugin, environmentId, pending, readOnly, reloadPlugin, status],
   );
 
+  // Rescan reloads changed plugins, which needs operate access; a read-only
+  // session still re-reads the status, which re-discovers the folder.
+  const rescan = useCallback(() => {
+    if (environmentId === null || rescanning) return;
+    if (readOnly) {
+      status.refresh();
+      return;
+    }
+    setRescanning(true);
+    void (async () => {
+      const result = await rescanPlugins({ environmentId, input: {} });
+      setRescanning(false);
+      status.refresh();
+      if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+        const error = squashAtomCommandFailure(result);
+        toastManager.add({
+          type: "error",
+          title: "Could not rescan plugins",
+          description:
+            error instanceof Error ? error.message : "The plugins folder could not be read.",
+        });
+      }
+    })();
+  }, [environmentId, readOnly, rescanPlugins, rescanning, status]);
+
   const countLabel = `${packages.length} ${packages.length === 1 ? "plugin" : "plugins"}`;
 
   return (
@@ -195,11 +224,11 @@ export function PluginsSettingsPanel() {
                     type="button"
                     size="icon-micro"
                     variant="ghost-muted"
-                    aria-label="Refresh plugins"
-                    disabled={status.isPending}
-                    onClick={status.refresh}
+                    aria-label="Rescan plugins"
+                    disabled={status.isPending || rescanning}
+                    onClick={rescan}
                   >
-                    {status.isPending ? (
+                    {status.isPending || rescanning ? (
                       <Spinner className="size-3" />
                     ) : (
                       <RefreshCwIcon className="size-3" />
@@ -207,7 +236,7 @@ export function PluginsSettingsPanel() {
                   </Button>
                 }
               />
-              <TooltipPopup side="top">Refresh plugins</TooltipPopup>
+              <TooltipPopup side="top">Rescan plugins</TooltipPopup>
             </Tooltip>
           </div>
         }

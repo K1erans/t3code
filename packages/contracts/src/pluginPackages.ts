@@ -50,7 +50,13 @@ export const PluginPackageActionInput = Schema.Struct({
 }).annotate({ parseOptions: { onExcessProperty: "error" } });
 export type PluginPackageActionInput = typeof PluginPackageActionInput.Type;
 
-export const PluginPackageOperation = Schema.Literals(["status", "enable", "disable", "reload"]);
+export const PluginPackageOperation = Schema.Literals([
+  "status",
+  "enable",
+  "disable",
+  "reload",
+  "rescan",
+]);
 export type PluginPackageOperation = typeof PluginPackageOperation.Type;
 
 export class PluginPackageNotFoundError extends Schema.TaggedError<PluginPackageNotFoundError>()(
