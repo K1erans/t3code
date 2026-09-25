@@ -18,14 +18,13 @@ describe("plugin package contracts", () => {
         errors: [],
         packages: [
           {
-            id: "com.acme.runtime-status",
-            name: "Runtime status",
+            id: "com.example.fixture",
+            name: "Fixture",
             version: "1.0.0",
-            apiVersion: 1,
             enabled: true,
             state: "active",
-            capabilities: ["t3.commands@1"],
-            contributions: { commands: ["acme.runtime-status"] },
+            requires: ["t3.commands@0"],
+            contributions: { commands: ["fixture.say-hello"] },
           },
         ],
       }),
@@ -33,14 +32,13 @@ describe("plugin package contracts", () => {
       errors: [],
       packages: [
         {
-          id: "com.acme.runtime-status",
-          name: "Runtime status",
+          id: "com.example.fixture",
+          name: "Fixture",
           version: "1.0.0",
-          apiVersion: 1,
           enabled: true,
           state: "active",
-          capabilities: ["t3.commands@1"],
-          contributions: { commands: ["acme.runtime-status"] },
+          requires: ["t3.commands@0"],
+          contributions: { commands: ["fixture.say-hello"] },
         },
       ],
     });
@@ -49,19 +47,19 @@ describe("plugin package contracts", () => {
   it("reports invalid discovered package directories without inventing an id", () => {
     expect(
       decodeStatus({
-        errors: [{ directory: "broken-package", error: "manifest api version is unsupported" }],
+        errors: [{ directory: "broken-package", error: "manifest version is unsupported" }],
         packages: [],
       }),
     ).toEqual({
-      errors: [{ directory: "broken-package", error: "manifest api version is unsupported" }],
+      errors: [{ directory: "broken-package", error: "manifest version is unsupported" }],
       packages: [],
     });
   });
 
   it("rejects malformed package ids and action payloads", () => {
-    expect(() => decodeAction({ id: "runtime-status" })).toThrow();
+    expect(() => decodeAction({ id: "fixture" })).toThrow();
     expect(() => decodeAction({ id: `com.${"a".repeat(252)}` })).toThrow();
-    expect(() => decodeAction({ id: "com.acme.runtime-status", extra: true })).toThrow();
+    expect(() => decodeAction({ id: "com.example.fixture", extra: true })).toThrow();
   });
 
   it("preserves operation causes without putting failure text in the stable message", () => {
@@ -72,10 +70,10 @@ describe("plugin package contracts", () => {
     expect(
       new PluginPackageOperationError({
         detail: "package is not enabled",
-        id: "com.acme.runtime-status",
+        id: "com.example.fixture",
         operation: "reload",
       }).message,
-    ).toBe("reload failed for plugin package com.acme.runtime-status: package is not enabled");
+    ).toBe("reload failed for plugin package com.example.fixture: package is not enabled");
   });
 
   it("registers fixed status and lifecycle rpc methods", () => {

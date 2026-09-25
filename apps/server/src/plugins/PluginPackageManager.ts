@@ -36,9 +36,12 @@ import * as PluginCommandCatalog from "./PluginCommandCatalog.ts";
 import * as PluginStorage from "./PluginStorage.ts";
 import { isHiddenPluginEntry, MANIFEST_FILE_NAME } from "./PluginInstall.ts";
 
-const COMMAND_CAPABILITY = "t3.commands@1";
-const MAX_REASON_LENGTH = 2_000;
+const COMMAND_CAPABILITY = "t3.commands@0";
+/** `api.storage` and `api.dataDir`. */
 const STORAGE_CAPABILITY = "t3.storage@0";
+/** Every host capability this T3 provides. A plugin requiring anything else fails activation. */
+const PROVIDED_CAPABILITIES: ReadonlyArray<string> = [COMMAND_CAPABILITY, STORAGE_CAPABILITY];
+const MAX_REASON_LENGTH = 2_000;
 /** Environment-owned plugin state, shared by every client connected to this environment. */
 const PLUGIN_STATE_FILE_NAME = "plugins.json";
 const MAX_ICON_BYTES = 32 * 1024;
@@ -75,14 +78,14 @@ interface PluginDataAccess {
 }
 
 export interface PluginPackageApi {
-  /** `<stateDir>/plugin-data/<pluginId>/`, present when the manifest declares `t3.storage@0`. */
+  /** `<stateDir>/plugin-data/<pluginId>/`, present when the manifest requires `t3.storage@0`. */
   readonly dataDir?: string;
   readonly storage?: PluginStorage.PluginStorage;
   readonly onDispose: (cleanup: () => void | Promise<void>) => void;
+  /** Registers a command declared in `contributes.commands`; the palette shows its manifest `title`. */
   readonly registerCommand: (
     command: {
       readonly id: string;
-      readonly label: string;
       readonly description?: string;
       readonly surfaces: ReadonlyArray<"web" | "desktop" | "mobile">;
     },
@@ -181,7 +184,10 @@ const makeDefinition = (
   data: PluginDataAccess | undefined,
   { guard, run, onCommandFailed, onRetired }: DefinitionHooks,
 ): PluginDefinition => {
-  const declaredCommands = new Set(discovered.manifest.contributes?.commands ?? []);
+  const declaredTitles = new Map(
+    (discovered.manifest.contributes?.commands ?? []).map((command) => [command.id, command.title]),
+  );
+  const requires = new Set(discovered.manifest.requires);
 
   return {
     id: discovered.manifest.id,
@@ -194,14 +200,20 @@ const makeDefinition = (
           context.onDispose(() => run(guard("dispose", cleanup)));
         },
         registerCommand(command, handler) {
-          if (!discovered.manifest.capabilities.includes(COMMAND_CAPABILITY)) {
-            throw new Error(`Manifest does not declare capability ${COMMAND_CAPABILITY}`);
+          if (!requires.has(COMMAND_CAPABILITY)) {
+            throw new Error(`Manifest does not require ${COMMAND_CAPABILITY}`);
           }
-          if (!declaredCommands.has(command.id)) {
+          const title = declaredTitles.get(command.id);
+          if (title === undefined) {
             throw new Error(`Command ${command.id} is not declared in the manifest`);
           }
           PluginCommandCatalog.registerPluginCommand(context, {
-            command,
+            command: {
+              id: command.id,
+              label: title,
+              ...(command.description === undefined ? {} : { description: command.description }),
+              surfaces: command.surfaces,
+            },
             handler: guard(`command ${command.id}`, handler).pipe(
               Effect.tapError(() => Effect.sync(onCommandFailed)),
               Effect.mapError(
@@ -466,7 +478,7 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
         continue;
       }
       const packageManifest = decoded.value;
-      if (packageManifest.entrypoints.server === undefined) {
+      if (packageManifest.entrypoints?.server === undefined) {
         errors.push({ directory: entry, error: "manifest must define entrypoints.server" });
         continue;
       }
@@ -484,7 +496,17 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
     discovered: DiscoveredPackage,
     operation: PluginPackageOperation,
   ) {
-    const serverEntrypoint = discovered.manifest.entrypoints.server;
+    const missing = discovered.manifest.requires.filter(
+      (capability) => !PROVIDED_CAPABILITIES.includes(capability),
+    );
+    if (missing.length > 0) {
+      return yield* operationError(
+        operation,
+        `Needs ${missing.join(", ")}; this T3 provides ${PROVIDED_CAPABILITIES.join(", ")}. Update T3 or use an older version of the plugin.`,
+        discovered.manifest.id,
+      );
+    }
+    const serverEntrypoint = discovered.manifest.entrypoints?.server;
     if (serverEntrypoint === undefined) {
       return yield* operationError(
         operation,
@@ -493,7 +515,7 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
       );
     }
     const packageFingerprint = yield* validatePackageTree(discovered, operation);
-    const data = discovered.manifest.capabilities.includes(STORAGE_CAPABILITY)
+    const data = discovered.manifest.requires.includes(STORAGE_CAPABILITY)
       ? yield* dataAccessFor(discovered.manifest.id, operation)
       : undefined;
     const sourceEntrypointPath = path.resolve(discovered.directory, serverEntrypoint);
@@ -647,7 +669,7 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
       if (packageManifest === undefined) continue;
       const directory = discovered.get(id)?.directory ?? path.join(pluginsDirectory, id);
       const iconUrl = yield* readIconUrl(directory, packageManifest.icon);
-      const olderApiRemovedIn = packageManifest.capabilities
+      const olderApiRemovedIn = packageManifest.requires
         .map((capability) => DEPRECATED_CAPABILITIES.get(capability))
         .find((version) => version !== undefined);
       const enabled = enabledIds.has(id);
@@ -656,17 +678,18 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
         packageErrors.get(id) ?? (enabled && !active ? "enabled package is not active" : undefined);
       packages.push({
         id: packageManifest.id,
-        name: packageManifest.name?.trim() || packageManifest.id,
+        name: packageManifest.name.trim() || packageManifest.id,
         ...(packageManifest.description?.trim()
           ? { description: packageManifest.description.trim() }
           : {}),
         ...(iconUrl === undefined ? {} : { iconUrl }),
         version: packageManifest.version,
-        apiVersion: packageManifest.apiVersion,
         enabled,
         state: error !== undefined ? "error" : active ? "active" : "disabled",
-        capabilities: [...packageManifest.capabilities],
-        contributions: { commands: [...(packageManifest.contributes?.commands ?? [])] },
+        requires: [...packageManifest.requires],
+        contributions: {
+          commands: (packageManifest.contributes?.commands ?? []).map((command) => command.id),
+        },
         ...(olderApiRemovedIn === undefined ? {} : { olderApiRemovedIn }),
         ...(error === undefined ? {} : { error }),
       });

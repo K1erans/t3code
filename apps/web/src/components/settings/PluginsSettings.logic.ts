@@ -14,10 +14,10 @@ const STATE_BADGES: Record<PluginPackageStatus["state"], PluginStatusBadge> = {
 
 /** The state badge plus API-compatibility warnings, in display order. */
 export function pluginStatusBadges(
-  pluginPackage: Pick<PluginPackageStatus, "state" | "capabilities" | "olderApiRemovedIn">,
+  pluginPackage: Pick<PluginPackageStatus, "state" | "requires" | "olderApiRemovedIn">,
 ): PluginStatusBadge[] {
   const badges = [STATE_BADGES[pluginPackage.state]];
-  if (pluginPackage.capabilities.some((capability) => capability.endsWith("@0"))) {
+  if (pluginPackage.requires.some((capability) => capability.endsWith("@0"))) {
     badges.push({ label: "Experimental API", variant: "warning" });
   }
   if (pluginPackage.olderApiRemovedIn !== undefined) {

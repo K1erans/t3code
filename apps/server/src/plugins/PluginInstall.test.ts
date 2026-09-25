@@ -23,11 +23,10 @@ const manifestJson = (version: string, id = pluginId) =>
   encodeManifest({
     manifestVersion: 1,
     id,
+    name: "Tasks",
     version,
-    apiVersion: 1,
+    requires: [],
     entrypoints: { server: "./index.mjs" },
-    capabilities: [],
-    contributes: {},
   });
 
 /** A minimal ustar archive, gzipped, with the `package/` prefix `npm pack` uses. */

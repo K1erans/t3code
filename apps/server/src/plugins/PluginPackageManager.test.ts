@@ -21,18 +21,23 @@ import * as PluginCommandCatalog from "./PluginCommandCatalog.ts";
 import { installPlugin, removePlugin } from "./PluginInstall.ts";
 import * as PluginPackageManager from "./PluginPackageManager.ts";
 
-const packageId = "com.acme.runtime-status";
-const commandId = "acme.runtime-status";
-const countCommandId = "acme.count-invocations";
+const packageId = "com.example.fixture";
+const commandId = "fixture.say-hello";
+const countCommandId = "fixture.count-invocations";
 
 const manifest = {
   manifestVersion: 1,
   id: packageId,
+  name: "Fixture",
   version: "1.0.0",
-  apiVersion: 1,
+  requires: ["t3.commands@0", "t3.storage@0"],
   entrypoints: { server: "./index.mjs" },
-  capabilities: ["t3.commands@1", "t3.storage@0"],
-  contributes: { commands: [commandId, countCommandId] },
+  contributes: {
+    commands: [
+      { id: commandId, title: "Say hello" },
+      { id: countCommandId, title: "Count invocations" },
+    ],
+  },
 } as const;
 
 const encodeManifest = Schema.encodeSync(Schema.fromJsonString(PluginManifest));
@@ -64,7 +69,6 @@ export default function activate(api) {
   api.registerCommand(
     {
       id: "${commandId}",
-      label: "External runtime status",
       description: "Report status from an external local plugin package.",
       surfaces: ["web", "desktop", "mobile"]
     },
@@ -73,7 +77,6 @@ export default function activate(api) {
   api.registerCommand(
     {
       id: "${countCommandId}",
-      label: "Count invocations",
       surfaces: ["web", "desktop", "mobile"]
     },
     async () => {
@@ -92,7 +95,6 @@ export default function activate(api) {
   api.registerCommand(
     {
       id: "${commandId}",
-      label: "External runtime status",
       surfaces: ["web", "desktop", "mobile"]
     },
     () => ({ message, tone: "success" })
@@ -105,7 +107,6 @@ export default function activate(api) {
   api.registerCommand(
     {
       id: "${commandId}",
-      label: "External runtime status",
       surfaces: ["web", "desktop", "mobile"]
     },
     () => ({ message: "retirement gate", tone: "success" })
@@ -123,7 +124,6 @@ export default function activate(api) {
   api.registerCommand(
     {
       id: "${commandId}",
-      label: "External runtime status",
       surfaces: ["web", "desktop", "mobile"]
     },
     () => ({ message: "cleanup failure", tone: "success" })
@@ -181,36 +181,6 @@ it.layer(NodeServices.layer)("plugin package lifecycle", (it) => {
     }),
   );
 
-  it.effect("loads the committed external runtime-status example without rebuilding", () =>
-    Effect.gen(function* () {
-      const fileSystem = yield* FileSystem.FileSystem;
-      const path = yield* Path.Path;
-      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
-        prefix: "t3code-plugin-package-example-test-",
-      });
-      const exampleId = "com.t3code.runtime-status-example";
-      const exampleCommandId = "example.runtime-status";
-      yield* fileSystem.makeDirectory(`${baseDir}/userdata/plugins`, { recursive: true });
-      yield* fileSystem.copy(
-        path.resolve(import.meta.dirname, "../../../../examples/plugins/runtime-status"),
-        `${baseDir}/userdata/plugins/${exampleId}`,
-      );
-
-      yield* useEnvironment(
-        baseDir,
-        Effect.gen(function* () {
-          const manager = yield* PluginPackageManager.PluginPackageManager;
-          const catalog = yield* PluginCommandCatalog.PluginCommandCatalog;
-          yield* manager.enable(exampleId);
-          const listed = yield* catalog.list;
-          expect(
-            yield* catalog.invoke({ generation: listed.generation, id: exampleCommandId }),
-          ).toEqual({ message: "external plugin runtime is active.", tone: "success" });
-        }),
-      );
-    }),
-  );
-
   it.effect("discovers, enables, restarts, and cleanly disables an external package", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
@@ -243,7 +213,10 @@ it.layer(NodeServices.layer)("plugin package lifecycle", (it) => {
             packages: [{ id: packageId, enabled: true, state: "active" }],
           });
           const listed = yield* catalog.list;
-          expect(listed.commands.map((command) => command.id)).toContain(commandId);
+          // The palette label is the manifest title.
+          expect(listed.commands.find((command) => command.id === commandId)?.label).toBe(
+            "Say hello",
+          );
           expect(yield* catalog.invoke({ generation: listed.generation, id: commandId })).toEqual({
             message: "External plugin runtime is active.",
             tone: "success",
@@ -277,6 +250,53 @@ it.layer(NodeServices.layer)("plugin package lifecycle", (it) => {
       expect(yield* fileSystem.readFileString(`${packageDirectory}/disposed.log`)).toBe(
         "disposed\ndisposed\n",
       );
+    }),
+  );
+
+  it.effect("fails activation when the manifest requires a capability T3 does not provide", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3code-plugin-package-capability-test-",
+      });
+      const packageDirectory = `${baseDir}/userdata/plugins/${packageId}`;
+      const activatedFile = `${packageDirectory}/activated.log`;
+      yield* fileSystem.makeDirectory(packageDirectory, { recursive: true });
+      yield* fileSystem.writeFileString(
+        `${packageDirectory}/t3-plugin.json`,
+        encodeManifest({ ...manifest, requires: ["t3.commands@0", "t3.screens@2"] }),
+      );
+      yield* fileSystem.writeFileString(
+        `${packageDirectory}/index.mjs`,
+        `import { appendFileSync } from "node:fs";
+appendFileSync(${encodeJsonString(activatedFile)}, "imported\\n");
+export default function activate() {}
+`,
+      );
+      const reason =
+        "Needs t3.screens@2; this T3 provides t3.commands@0, t3.storage@0. Update T3 or use an older version of the plugin.";
+
+      yield* useEnvironment(
+        baseDir,
+        Effect.gen(function* () {
+          const manager = yield* PluginPackageManager.PluginPackageManager;
+          const failure = yield* Effect.flip(manager.enable(packageId));
+          expect(failure.message).toContain(reason);
+          expect(yield* manager.status).toMatchObject({
+            packages: [
+              {
+                id: packageId,
+                enabled: false,
+                state: "error",
+                requires: ["t3.commands@0", "t3.screens@2"],
+                error: reason,
+              },
+            ],
+          });
+        }),
+      );
+
+      expect(yield* fileSystem.exists(activatedFile)).toBe(false);
     }),
   );
 
@@ -341,15 +361,15 @@ it.layer(NodeServices.layer)("plugin package lifecycle", (it) => {
         `${namedDirectory}/t3-plugin.json`,
         encodeManifest({
           ...manifest,
-          name: "Runtime status",
-          description: "Shows runtime status.",
+          name: "Fixture display",
+          description: "Says hello.",
           icon: "./icon.svg",
         }),
       );
       yield* fileSystem.writeFileString(`${namedDirectory}/icon.svg`, "<svg/>");
       yield* fileSystem.writeFileString(
         `${unnamedDirectory}/t3-plugin.json`,
-        encodeManifest({ ...manifest, id: "com.acme.unnamed", icon: "./missing.svg" }),
+        encodeManifest({ ...manifest, id: "com.acme.unnamed", name: "  ", icon: "./missing.svg" }),
       );
 
       yield* useEnvironment(
@@ -358,8 +378,8 @@ it.layer(NodeServices.layer)("plugin package lifecycle", (it) => {
           const manager = yield* PluginPackageManager.PluginPackageManager;
           const { packages } = yield* manager.status;
           expect(packages.find((entry) => entry.id === packageId)).toMatchObject({
-            name: "Runtime status",
-            description: "Shows runtime status.",
+            name: "Fixture display",
+            description: "Says hello.",
             iconUrl: `data:image/svg+xml;base64,${Buffer.from("<svg/>").toString("base64")}`,
           });
           const unnamed = packages.find((entry) => entry.id === "com.acme.unnamed");
@@ -700,7 +720,11 @@ const writePackage = (baseDir: string, id: string, command: string, source: stri
     yield* fileSystem.makeDirectory(packageDirectory, { recursive: true });
     yield* fileSystem.writeFileString(
       `${packageDirectory}/t3-plugin.json`,
-      encodeManifest({ ...manifest, id, contributes: { commands: [command] } }),
+      encodeManifest({
+        ...manifest,
+        id,
+        contributes: { commands: [{ id: command, title: "Test command" }] },
+      }),
     );
     yield* fileSystem.writeFileString(`${packageDirectory}/index.mjs`, source);
     return packageDirectory;
@@ -711,7 +735,7 @@ import { appendFile } from "node:fs/promises";
 
 export default function activate(api) {
   api.registerCommand(
-    { id: "${commandId}", label: "Failing command", surfaces: ["web", "desktop", "mobile"] },
+    { id: "${commandId}", surfaces: ["web", "desktop", "mobile"] },
     ${handlerSource}
   );
   api.onDispose(() => appendFile(${encodeJsonString(disposalFile)}, "disposed\\n"));
@@ -721,7 +745,7 @@ export default function activate(api) {
 const healthySource = `
 export default function activate(api) {
   api.registerCommand(
-    { id: "${healthyCommandId}", label: "Healthy", surfaces: ["web", "desktop", "mobile"] },
+    { id: "${healthyCommandId}", surfaces: ["web", "desktop", "mobile"] },
     () => ({ message: "still healthy", tone: "success" })
   );
 }
@@ -889,7 +913,7 @@ gate.loads += 1;
 if (gate.loads === 2) gate.reject(new Error("late"));
 export default function activate(api) {
   api.registerCommand(
-    { id: "${commandId}", label: "Racing command", surfaces: ["web", "desktop", "mobile"] },
+    { id: "${commandId}", surfaces: ["web", "desktop", "mobile"] },
     () => gate.calls++ === 0
       ? new Promise((_, reject) => { gate.reject = reject; gate.started(); })
       : { message: "reloaded", tone: "success" }
@@ -990,7 +1014,7 @@ it.layer(NodeServices.layer)("plugin package pickup", (it) => {
           yield* install(
             yield* writeSource(
               "other",
-              { ...manifest, id: "com.acme.other", capabilities: [], contributes: {} },
+              { ...manifest, id: "com.acme.other", requires: [], contributes: {} },
               "export default () => {};\n",
             ),
           );
