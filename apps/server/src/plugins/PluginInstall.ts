@@ -78,8 +78,12 @@ export const readPluginManifest = Effect.fn("PluginInstall.readPluginManifest")(
     ),
   );
   const server = manifest.entrypoints?.server;
+  // Optional in the schema, but in v0 a plugin without a server entry has nothing to run.
   if (server === undefined) {
-    return yield* new PluginInstallError({ detail: "manifest must define entrypoints.server" });
+    return yield* new PluginInstallError({
+      detail:
+        "entrypoints.server is missing: this version of T3 only runs plugins with a server entry point",
+    });
   }
   if (resolvePackageEntrypoint(path, directory, server) === undefined) {
     return yield* new PluginInstallError({ detail: "entrypoints.server escapes the package" });
