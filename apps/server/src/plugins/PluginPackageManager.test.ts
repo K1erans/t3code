@@ -1104,7 +1104,7 @@ it.layer(NodeServices.layer)("plugin failure containment", (it) => {
     }),
   );
 
-  it.effect("ignores a failure from the previous version's command after a reload", () =>
+  it.effect("retires the previous version after its running command fails, keeping the reload", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
       const baseDir = yield* fileSystem.makeTempDirectoryScoped({
@@ -1125,13 +1125,16 @@ it.layer(NodeServices.layer)("plugin failure containment", (it) => {
           );
           yield* Effect.promise(() => started);
 
-          // Neither status nor a reload waits for the slow command.
+          // Status does not wait for the slow command. A reload does: it disposes the
+          // previous version only once the command running on it finishes.
           expect((yield* manager.status).packages).toMatchObject([
             { id: packageId, state: "active" },
           ]);
-          yield* manager.reload(packageId);
+          const reloading = yield* Effect.forkChild(manager.reload(packageId));
+          yield* Effect.yieldNow;
           gate.reject(new Error("late"));
           expect((yield* Fiber.await(invoking))._tag).toBe("Failure");
+          yield* Fiber.join(reloading);
 
           const status = yield* manager.status;
           expect(status.packages).toMatchObject([{ id: packageId, state: "active" }]);

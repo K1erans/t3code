@@ -36,6 +36,8 @@ interface LivePlugin {
   readonly scope: Scope.Closeable;
   readonly contributions: ReadonlyMap<string, ReadonlyArray<LiveContribution>>;
   readonly cleanupErrors: Array<unknown>;
+  /** Contribution invocations still running against this plugin's scope. */
+  readonly invocations: { count: number; readonly drained: Array<() => void> };
 }
 
 interface LiveComposition {
@@ -410,6 +412,28 @@ export const make = (options: PluginRuntimeOptions = {}) =>
         }
       });
 
+    // Invocations run outside the transition lock, so a retiring plugin may still be
+    // serving one. Its scope (and every onDispose handler) closes only once they finish;
+    // the host bounds how long an invocation may run.
+    const awaitInvocations = (plugin: LivePlugin): Effect.Effect<void> =>
+      Effect.callback<void>((resume) => {
+        if (plugin.invocations.count === 0) return resume(Effect.void);
+        plugin.invocations.drained.push(() => resume(Effect.void));
+      });
+
+    const trackInvocation = (plugin: LivePlugin): (() => void) => {
+      plugin.invocations.count += 1;
+      return () => {
+        plugin.invocations.count -= 1;
+        if (plugin.invocations.count > 0) return;
+        // Wake waiters outside the contribution's callback context, so a resumed
+        // transition is not mistaken for a reentrant call from the contribution.
+        callbackContext.exit(() => {
+          for (const wake of plugin.invocations.drained.splice(0)) wake();
+        });
+      };
+    };
+
     const closePlugins = (
       plugins: ReadonlyArray<LivePlugin>,
       notifyDeactivation: boolean,
@@ -417,6 +441,7 @@ export const make = (options: PluginRuntimeOptions = {}) =>
       Effect.gen(function* () {
         const failures: Array<CleanupFailure> = [];
         for (const plugin of plugins.toReversed()) {
+          yield* awaitInvocations(plugin);
           const closeExit = yield* Effect.exit(Scope.close(plugin.scope, Exit.void));
           if (Exit.isFailure(closeExit)) {
             failures.push({
@@ -480,7 +505,13 @@ export const make = (options: PluginRuntimeOptions = {}) =>
           const contributions = new Map<string, Array<LiveContribution>>();
           const cleanupErrors: Array<unknown> = [];
           const finalizers: Array<() => void | Promise<void>> = [];
-          const plugin: LivePlugin = { definition, scope, contributions, cleanupErrors };
+          const plugin: LivePlugin = {
+            definition,
+            scope,
+            contributions,
+            cleanupErrors,
+            invocations: { count: 0, drained: [] },
+          };
           let activating = true;
           const assertActivating = (method: "resolve" | "register" | "onDispose") => {
             if (!activating) {
@@ -696,9 +727,9 @@ export const make = (options: PluginRuntimeOptions = {}) =>
       rejectReentrancy(operation, () => transitionSemaphore.withPermits(1)(effect()));
 
     // Invocations read the committed composition without the transition lock, so a slow
-    // contribution never delays reconcile, dispose or other invocations. An invocation
-    // that is running when its plugin retires keeps running to completion; the host
-    // decides whether its outcome still matters. A disposed runtime starts no new ones.
+    // contribution never delays other invocations. A reconcile or dispose commits at once
+    // but closes a retiring plugin's scope only after its running invocations finish, so
+    // they never resume with closed resources. A disposed runtime starts no new ones.
     const useContribution = <Value, Success, Failure, Requirements>(
       slot: string,
       id: string,
@@ -706,67 +737,76 @@ export const make = (options: PluginRuntimeOptions = {}) =>
       use: (value: Value) => Effect.Effect<Success, Failure, Requirements>,
     ): Effect.Effect<Success, Failure | PluginRuntimeContributionError, Requirements> =>
       rejectReentrancy("invoke", () =>
-        Effect.suspend<
-          Success,
-          | Failure
-          | PluginContributionGenerationError
-          | PluginContributionNotFoundError
-          | PluginRuntimeDisposedError,
-          Requirements
-        >(() => {
-          if (disposalStarted) {
-            return Effect.fail(new PluginRuntimeDisposedError({ operation: "invoke" }));
-          }
-          if (current.generation !== generation) {
-            return Effect.fail(
-              new PluginContributionGenerationError({
-                actual: current.generation,
-                expected: generation,
-              }),
-            );
-          }
-          for (const plugin of current.plugins) {
-            const registration = (plugin.contributions.get(slot) ?? []).find(
-              (candidate) => candidate.contribution.id === id,
-            );
-            if (registration !== undefined) {
-              const contributionState: PluginEffectCallbackContext = {
-                active: true,
-                callback: "contribution",
-                pluginId: plugin.definition.id,
-                runtime: runtimeIdentity,
-              };
-              const contributionScheduler: Scheduler.Scheduler = {
-                executionMode: baseScheduler.executionMode,
-                shouldYield: (fiber) => baseScheduler.shouldYield(fiber),
-                makeDispatcher: () => {
-                  const dispatcher = baseScheduler.makeDispatcher();
-                  return {
-                    flush: () => dispatcher.flush(),
-                    scheduleTask: (task, priority) =>
-                      dispatcher.scheduleTask(
-                        () => callbackContext.run(contributionState, task),
-                        priority,
-                      ),
-                  };
-                },
-              };
-              return Effect.yieldNow.pipe(
-                Effect.andThen(Effect.suspend(() => use(registration.value as Value))),
-                Effect.provideService(PluginEffectCallback, contributionState),
-                Effect.provideService(Scheduler.Scheduler, contributionScheduler),
-                Effect.onExit((exit) =>
-                  Effect.sync(() => {
-                    if (!(Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause))) {
-                      contributionState.active = false;
-                    }
-                  }),
-                ),
+        Effect.uninterruptibleMask((restore) =>
+          Effect.suspend<
+            Success,
+            | Failure
+            | PluginContributionGenerationError
+            | PluginContributionNotFoundError
+            | PluginRuntimeDisposedError,
+            Requirements
+          >(() => {
+            if (disposalStarted) {
+              return Effect.fail(new PluginRuntimeDisposedError({ operation: "invoke" }));
+            }
+            if (current.generation !== generation) {
+              return Effect.fail(
+                new PluginContributionGenerationError({
+                  actual: current.generation,
+                  expected: generation,
+                }),
               );
             }
-          }
-          return Effect.fail(new PluginContributionNotFoundError({ id, slot }));
-        }),
+            for (const plugin of current.plugins) {
+              const registration = (plugin.contributions.get(slot) ?? []).find(
+                (candidate) => candidate.contribution.id === id,
+              );
+              if (registration !== undefined) {
+                const contributionState: PluginEffectCallbackContext = {
+                  active: true,
+                  callback: "contribution",
+                  pluginId: plugin.definition.id,
+                  runtime: runtimeIdentity,
+                };
+                const contributionScheduler: Scheduler.Scheduler = {
+                  executionMode: baseScheduler.executionMode,
+                  shouldYield: (fiber) => baseScheduler.shouldYield(fiber),
+                  makeDispatcher: () => {
+                    const dispatcher = baseScheduler.makeDispatcher();
+                    return {
+                      flush: () => dispatcher.flush(),
+                      scheduleTask: (task, priority) =>
+                        dispatcher.scheduleTask(
+                          () => callbackContext.run(contributionState, task),
+                          priority,
+                        ),
+                    };
+                  },
+                };
+                // Counted in the same synchronous step that read `current`, so a
+                // reconcile that retires this plugin always sees the invocation.
+                const release = trackInvocation(plugin);
+                return restore(
+                  Effect.yieldNow.pipe(
+                    Effect.andThen(Effect.suspend(() => use(registration.value as Value))),
+                    Effect.provideService(PluginEffectCallback, contributionState),
+                    Effect.provideService(Scheduler.Scheduler, contributionScheduler),
+                  ),
+                ).pipe(
+                  Effect.onExit((exit) =>
+                    Effect.sync(() => {
+                      if (!(Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause))) {
+                        contributionState.active = false;
+                      }
+                      release();
+                    }),
+                  ),
+                );
+              }
+            }
+            return Effect.fail(new PluginContributionNotFoundError({ id, slot }));
+          }),
+        ),
       );
 
     yield* Effect.addFinalizer(() =>

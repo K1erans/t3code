@@ -277,15 +277,15 @@ describe("plugin runtime live contributions", () => {
 
       const slow = yield* Effect.forkChild(use("slow", first.generation));
       yield* Effect.promise(() => started);
-      // Neither another invocation nor a reconcile waits for the running one.
+      // Another invocation does not wait for the running one.
       expect(yield* use("fast", first.generation)).toBe("1.0.0");
-      yield* runtime.reconcile([definition("2.0.0")]);
-      const second = yield* runtime.contributions("commands");
-      expect(yield* use("fast", second.generation)).toBe("2.0.0");
-
-      // The retired version's invocation still completes.
+      // A reconcile retiring the version finishes once the running invocation does.
+      const reconciling = yield* Effect.forkChild(runtime.reconcile([definition("2.0.0")]));
       yield* Deferred.succeed(release, undefined);
       expect(yield* Fiber.join(slow)).toBe("1.0.0");
+      yield* Fiber.join(reconciling);
+      const second = yield* runtime.contributions("commands");
+      expect(yield* use("fast", second.generation)).toBe("2.0.0");
 
       yield* runtime.dispose;
       const afterDispose = yield* Effect.exit(use("fast", second.generation));
@@ -295,6 +295,76 @@ describe("plugin runtime live contributions", () => {
           _tag: "PluginRuntimeDisposedError",
         });
       }
+    }),
+  );
+
+  it.effect("closes a retiring plugin's scope only after its running invocations finish", () =>
+    Effect.gen(function* () {
+      const events: Array<string> = [];
+      const release = yield* Deferred.make<void>();
+      let markStarted!: () => void;
+      const started = new Promise<void>((resolve) => {
+        markStarted = resolve;
+      });
+      // Reported after the replacement commits, just before the retiring scope closes.
+      let markCommitted!: () => void;
+      const committed = new Promise<void>((resolve) => {
+        markCommitted = resolve;
+      });
+      let slowActivations = 0;
+      const runtime = yield* PluginRuntime.make({
+        onLifecycle: ({ phase, pluginId }) => {
+          if (phase === "activate" && pluginId === "acme.slow" && ++slowActivations === 2) {
+            markCommitted();
+          }
+        },
+      });
+      const slowPlugin = (version: string): PluginDefinition => ({
+        id: "acme.slow",
+        version,
+        activate(context) {
+          context.onDispose(() => {
+            events.push(`disposed ${version}`);
+          });
+          context.register(
+            "commands",
+            { id: "slow", label: "Slow" },
+            Effect.sync(() => markStarted()).pipe(
+              Effect.andThen(Deferred.await(release)),
+              Effect.andThen(Effect.sync(() => events.push(`finished ${version}`))),
+            ),
+          );
+        },
+      });
+      const otherPlugin: PluginDefinition = {
+        id: "acme.other",
+        version: "1.0.0",
+        activate(context) {
+          context.register("commands", { id: "other", label: "Other" }, Effect.succeed("other"));
+        },
+      };
+      yield* runtime.reconcile([otherPlugin, slowPlugin("1.0.0")]);
+      const first = yield* runtime.contributions("commands");
+      const use = <A>(id: string, generation: number) =>
+        runtime.useContribution("commands", id, generation, (handler: Effect.Effect<A>) => handler);
+
+      const slow = yield* Effect.forkChild(use("slow", first.generation));
+      yield* Effect.promise(() => started);
+      const reconciling = yield* Effect.forkChild(
+        runtime.reconcile([otherPlugin, slowPlugin("2.0.0")]),
+      );
+      yield* Effect.promise(() => committed);
+      // The retiring version is still serving its invocation, so its disposer waits,
+      // while other plugins keep serving invocations from the new generation.
+      expect(events).toEqual([]);
+      const second = yield* runtime.contributions("commands");
+      expect(second.generation).toBe(first.generation + 1);
+      expect(yield* use("other", second.generation)).toBe("other");
+
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(slow);
+      yield* Fiber.join(reconciling);
+      expect(events).toEqual(["finished 1.0.0", "disposed 1.0.0"]);
     }),
   );
 

@@ -32,10 +32,13 @@ and rescan. Command invocations and `pluginPackages.status` take neither lock. A
 up to the entry point timeout, and holding a lock that long would stall every other command, every
 lifecycle action and every client's Settings, including remote and mobile ones.
 
-The consequence is that a command can outlive the version it started on. It keeps running (its code
-is already loaded) and its caller still gets its result, but its failure is attributed by
-definition identity: only a failure from the version that is still active marks the package failed
-or retires it. A disposed runtime starts no new invocations.
+The consequence is that a reload or disable can commit while a command of the retiring version is
+still running. The new version serves invocations at once, but the old version's scope, and so its
+`onDispose` handlers, closes only after its running commands finish, so a command never resumes
+with closed resources. That wait holds the lifecycle locks for at most the entry point timeout;
+other plugins' commands and status are unaffected. A command's failure is attributed by definition
+identity: only a failure from the version that is still active marks the package failed or retires
+it. A disposed runtime starts no new invocations.
 
 For the same reason, plugins never delay server startup. Enabled packages activate in a background
 rescan and show as Idle until they do.
