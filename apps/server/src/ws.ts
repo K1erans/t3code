@@ -89,6 +89,8 @@ import * as CheckpointDiffQuery from "./checkpointing/CheckpointDiffQuery.ts";
 import * as ServerConfig from "./config.ts";
 import * as EnvironmentTheme from "./environmentTheme.ts";
 import * as Keybindings from "./keybindings.ts";
+import * as PluginCommandCatalog from "./plugins/PluginCommandCatalog.ts";
+import * as PluginPackageManager from "./plugins/PluginPackageManager.ts";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
 import {
   projectActivityEvent,
@@ -499,6 +501,8 @@ const makeWsRpcLayer = (
   clientOrigin: OrchestrationClientOrigin,
   clientAnalyticsProps: Readonly<Record<string, unknown>>,
   previewAutomationBroker: PreviewAutomationBroker.PreviewAutomationBroker["Service"],
+  pluginCommands: PluginCommandCatalog.PluginCommandCatalog["Service"],
+  pluginPackages: PluginPackageManager.PluginPackageManager["Service"],
 ) =>
   WsRpcGroup.toLayer(
     Effect.gen(function* () {
@@ -2357,6 +2361,30 @@ const makeWsRpcLayer = (
               "rpc.aggregate": "server",
             },
           ),
+        [WS_METHODS.pluginCommandsList]: (_input) =>
+          observeRpcEffect(WS_METHODS.pluginCommandsList, pluginCommands.list, {
+            "rpc.aggregate": "pluginCommands",
+          }),
+        [WS_METHODS.pluginCommandsInvoke]: (input) =>
+          observeRpcEffect(WS_METHODS.pluginCommandsInvoke, pluginCommands.invoke(input), {
+            "rpc.aggregate": "pluginCommands",
+          }),
+        [WS_METHODS.pluginPackagesStatus]: (_input) =>
+          observeRpcEffect(WS_METHODS.pluginPackagesStatus, pluginPackages.status, {
+            "rpc.aggregate": "pluginPackages",
+          }),
+        [WS_METHODS.pluginPackagesEnable]: (input) =>
+          observeRpcEffect(WS_METHODS.pluginPackagesEnable, pluginPackages.enable(input.id), {
+            "rpc.aggregate": "pluginPackages",
+          }),
+        [WS_METHODS.pluginPackagesDisable]: (input) =>
+          observeRpcEffect(WS_METHODS.pluginPackagesDisable, pluginPackages.disable(input.id), {
+            "rpc.aggregate": "pluginPackages",
+          }),
+        [WS_METHODS.pluginPackagesReload]: (input) =>
+          observeRpcEffect(WS_METHODS.pluginPackagesReload, pluginPackages.reload(input.id), {
+            "rpc.aggregate": "pluginPackages",
+          }),
         [WS_METHODS.serverRefreshProviders]: (input) =>
           observeRpcEffect(
             WS_METHODS.serverRefreshProviders,
@@ -3778,6 +3806,10 @@ const makeWsRpcLayer = (
             ),
             { "rpc.aggregate": "server" },
           ),
+        [WS_METHODS.subscribePluginCommands]: (_input) =>
+          observeRpcStream(WS_METHODS.subscribePluginCommands, pluginCommands.changes, {
+            "rpc.aggregate": "pluginCommands",
+          }),
       });
     }),
   );
@@ -3785,6 +3817,8 @@ const makeWsRpcLayer = (
 export const websocketRpcRouteLayer = Layer.unwrap(
   Effect.gen(function* () {
     const previewAutomationBroker = yield* PreviewAutomationBroker.PreviewAutomationBroker;
+    const pluginCommands = yield* PluginCommandCatalog.PluginCommandCatalog;
+    const pluginPackages = yield* PluginPackageManager.PluginPackageManager;
     const baseServerSelfUpdate = yield* ServerSelfUpdate.ServerSelfUpdate;
     const config = yield* ServerConfig.ServerConfig;
     const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
@@ -3851,6 +3885,8 @@ export const websocketRpcRouteLayer = Layer.unwrap(
               clientOrigin,
               clientAnalyticsProps,
               previewAutomationBroker,
+              pluginCommands,
+              pluginPackages,
             ).pipe(
               Layer.provideMerge(RpcSerialization.layerJson),
               Layer.provide(Layer.succeed(SqlClient.SqlClient, sql)),
@@ -3897,4 +3933,6 @@ export const websocketRpcRouteLayer = Layer.unwrap(
       ),
     );
   }),
+).pipe(
+  Layer.provide(PluginPackageManager.layer.pipe(Layer.provideMerge(PluginCommandCatalog.layer))),
 );
