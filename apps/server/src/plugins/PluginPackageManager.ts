@@ -20,6 +20,7 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
@@ -416,7 +417,12 @@ export const make = Effect.fn("PluginPackageManager.make")(function* () {
       Effect.mapError((error) => operationError(operation, error, id)),
     );
 
-  /** Inlines a small package icon so every client, local or remote, can render it. */
+  const iconCache = new Map<string, { readonly stamp: string; readonly url: string }>();
+
+  /**
+   * Inlines a small package icon so every client, local or remote, can render it.
+   * Encoded icons are cached by path, size and mtime so status refreshes skip the read.
+   */
   const readIconUrl = (directory: string, icon: string | undefined) =>
     Effect.gen(function* () {
       if (icon === undefined) return undefined;
@@ -428,8 +434,13 @@ export const make = Effect.fn("PluginPackageManager.make")(function* () {
       if (!canonicalIcon.startsWith(`${canonicalDirectory}${path.sep}`)) return undefined;
       const info = yield* fileSystem.stat(canonicalIcon);
       if (info.type !== "File" || Number(info.size) > MAX_ICON_BYTES) return undefined;
+      const stamp = `${info.size}:${Option.match(info.mtime, { onNone: () => "", onSome: (mtime) => mtime.getTime() })}`;
+      const cached = iconCache.get(canonicalIcon);
+      if (cached?.stamp === stamp) return cached.url;
       const bytes = yield* fileSystem.readFile(canonicalIcon);
-      return `data:${mimeType};base64,${Buffer.from(bytes).toString("base64")}`;
+      const url = `data:${mimeType};base64,${Buffer.from(bytes).toString("base64")}`;
+      iconCache.set(canonicalIcon, { stamp, url });
+      return url;
     }).pipe(Effect.orElseSucceed(() => undefined));
 
   const statusUnlocked = Effect.fn("PluginPackageManager.status")(function* (
