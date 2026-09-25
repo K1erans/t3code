@@ -10,6 +10,7 @@ import { WS_METHODS, WsRpcGroup } from "./rpc.ts";
 
 const decodeStatus = Schema.decodeUnknownSync(PluginPackageStatusSnapshot);
 const decodeAction = Schema.decodeUnknownSync(PluginPackageActionInput);
+const encodeOperationError = Schema.encodeSync(PluginPackageOperationError);
 
 describe("plugin package contracts", () => {
   it("decodes environment package status", () => {
@@ -62,11 +63,14 @@ describe("plugin package contracts", () => {
     expect(() => decodeAction({ id: "com.example.fixture", extra: true })).toThrow();
   });
 
-  it("preserves operation causes without putting failure text in the stable message", () => {
-    const cause = new Error("disk exploded");
-    const error = new PluginPackageOperationError({ cause, operation: "enable" });
-    expect(error.cause).toBe(cause);
-    expect(error.message).toBe("enable failed for plugin packages");
+  it("carries only a readable detail over the wire", () => {
+    const error = new PluginPackageOperationError({ detail: "disk exploded", operation: "enable" });
+    expect(error.message).toBe("enable failed for plugin packages: disk exploded");
+    expect(encodeOperationError(error)).toEqual({
+      _tag: "PluginPackageOperationError",
+      detail: "disk exploded",
+      operation: "enable",
+    });
     expect(
       new PluginPackageOperationError({
         detail: "package is not enabled",

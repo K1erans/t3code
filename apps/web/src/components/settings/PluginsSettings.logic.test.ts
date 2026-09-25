@@ -63,13 +63,12 @@ describe("pluginActionErrorText", () => {
       id: "acme.tools",
       operation: "enable",
       detail: "activate() threw: missing API key",
-      cause: new Error("stack-bearing cause"),
     });
     expect(pluginActionErrorText(error)).toBe("activate() threw: missing API key");
   });
 
   it("falls back to the message, then to nothing", () => {
-    expect(pluginActionErrorText(new PluginPackageOperationError({ operation: "rescan" }))).toBe(
+    expect(pluginActionErrorText(new Error("rescan failed for plugin packages"))).toBe(
       "rescan failed for plugin packages",
     );
     expect(pluginActionErrorText(new Error("  "))).toBeNull();

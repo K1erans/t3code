@@ -91,13 +91,12 @@ export class PluginPackageOperationError extends Schema.TaggedError<PluginPackag
   {
     id: Schema.optional(PluginPackageId),
     operation: PluginPackageOperation,
-    detail: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(2_000))),
-    cause: Schema.optional(Schema.Defect()),
+    /** A readable reason. The underlying server error stays in the server log, never on the wire. */
+    detail: TrimmedNonEmptyString.check(Schema.isMaxLength(2_000)),
   },
 ) {
   override get message(): string {
     const packageName = this.id === undefined ? "plugin packages" : `plugin package ${this.id}`;
-    const detail = this.detail === undefined ? "" : `: ${this.detail}`;
-    return `${this.operation} failed for ${packageName}${detail}`;
+    return `${this.operation} failed for ${packageName}: ${this.detail}`;
   }
 }
