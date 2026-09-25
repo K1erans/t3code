@@ -787,4 +787,73 @@ describe("plugin failure containment", () => {
       }).pipe(Effect.provide(NodeServices.layer)),
     );
   }
+
+  it.live("keeps a reload active when the previous version's command fails during it", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3code-plugin-reload-race-test-",
+      });
+      const gateSymbol = `t3.test.plugin.reload-race.${baseDir}`;
+      let markStarted!: () => void;
+      const started = new Promise<void>((resolve) => {
+        markStarted = resolve;
+      });
+      const gate = {
+        loads: 0,
+        calls: 0,
+        started: markStarted,
+        reject: (() => {}) as (error: Error) => void,
+      };
+      Reflect.set(globalThis, Symbol.for(gateSymbol), gate);
+      // The first call blocks; importing the reloaded version rejects it mid-reload.
+      yield* writePackage(
+        baseDir,
+        packageId,
+        commandId,
+        `
+const gate = globalThis[Symbol.for(${encodeJsonString(gateSymbol)})];
+gate.loads += 1;
+if (gate.loads === 2) gate.reject(new Error("late"));
+export default function activate(api) {
+  api.registerCommand(
+    { id: "${commandId}", label: "Racing command", surfaces: ["web", "desktop", "mobile"] },
+    () => gate.calls++ === 0
+      ? new Promise((_, reject) => { gate.reject = reject; gate.started(); })
+      : { message: "reloaded", tone: "success" }
+  );
+}
+`,
+      );
+
+      yield* useEnvironment(
+        baseDir,
+        Effect.gen(function* () {
+          const manager = yield* PluginPackageManager.PluginPackageManager;
+          const catalog = yield* PluginCommandCatalog.PluginCommandCatalog;
+          yield* manager.enable(packageId);
+          const invoking = yield* Effect.forkChild(
+            manager.invokeCommand({ generation: (yield* catalog.list).generation, id: commandId }),
+          );
+          yield* Effect.promise(() => started);
+
+          expect((yield* manager.reload(packageId)).packages).toMatchObject([
+            { id: packageId, state: "active" },
+          ]);
+          expect((yield* Fiber.await(invoking))._tag).toBe("Failure");
+
+          const status = yield* manager.status;
+          expect(status.packages).toMatchObject([{ id: packageId, state: "active" }]);
+          expect(status.packages[0]?.error).toBeUndefined();
+          expect(
+            yield* manager.invokeCommand({
+              generation: (yield* catalog.list).generation,
+              id: commandId,
+            }),
+          ).toEqual({ message: "reloaded", tone: "success" });
+        }),
+      );
+      Reflect.deleteProperty(globalThis, Symbol.for(gateSymbol));
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
 });

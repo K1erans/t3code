@@ -601,6 +601,12 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
           activeCacheDirectories.set(id, loaded.cacheDirectory);
           activeManifests.set(id, pluginPackage.manifest);
           activeRetirements.set(id, loaded.retired);
+          if (reconciled._tag === "Success") {
+            // A command of the previous version can fail while reconcile waits for it; that
+            // failure belongs to the retired version and must not retire or mark this one.
+            packageErrors.delete(id);
+            failedCommandPlugins.delete(id);
+          }
           if (previousCacheDirectory !== undefined) {
             if (reconciled._tag === "Failure" && previousRetirement !== undefined) {
               yield* Effect.promise(() => previousRetirement);
