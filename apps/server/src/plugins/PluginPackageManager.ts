@@ -15,6 +15,7 @@ import {
 import type { PluginActivationContext, PluginDefinition } from "@t3tools/plugin-runtime";
 import type { PluginManifest } from "@t3tools/plugin-runtime/manifest";
 import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
@@ -24,7 +25,6 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
-import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
@@ -313,36 +313,44 @@ export class PluginPackageManager extends Context.Service<
 
 /** Long enough to fold the burst of events one install or copy produces. */
 export const WATCH_DEBOUNCE = Duration.millis(250);
-/** Waits between attempts to re-establish a lost watch: doubling from 250ms, capped at 30s. */
-export const WATCH_RETRY = Schedule.min([
-  Schedule.exponential(WATCH_DEBOUNCE),
-  Schedule.spaced("30 seconds"),
-]);
+/** A watch that stayed up this long was healthy, so losing it restarts the backoff. */
+export const WATCH_HEALTHY_AFTER = Duration.minutes(1);
+/** The wait before the nth retry of a watch that keeps failing: doubling from 250ms, capped at 30s. */
+const watchRetryDelay = (retry: number) =>
+  Duration.min(Duration.times(WATCH_DEBOUNCE, 2 ** Math.min(retry, 16)), Duration.seconds(30));
 
 /**
  * Runs `rescan` once per debounced burst of top-level `plugins/` events.
  * Rescan failures are logged and never stop the watch. When the watch itself
  * ends or fails (for example because `plugins/` was deleted), `prepare`
- * recreates the folder and the watch is re-established with a backoff, starting
- * with one rescan to catch up on changes made while it was down.
+ * recreates the folder and the watch is re-established, starting with one
+ * rescan to catch up on changes made while it was down. The first attempt after
+ * a healthy watch is immediate; attempts after one that failed back off.
  */
 export const watchPluginsDirectory = <E, R, PrepareError, RescanError>(
   events: Stream.Stream<unknown, E, R>,
   prepare: Effect.Effect<void, PrepareError>,
   rescan: Effect.Effect<unknown, RescanError>,
-) => {
-  const watch = (source: Stream.Stream<unknown, E, R>) =>
-    source.pipe(
-      Stream.debounce(WATCH_DEBOUNCE),
-      Stream.runForEach(() => rescan.pipe(Effect.ignoreCause({ log: true }))),
-      Effect.ignoreCause({ log: true }),
-    );
-  const reestablish = prepare.pipe(
-    Effect.andThen(watch(Stream.concat(Stream.make(undefined), events))),
-    Effect.ignoreCause({ log: true }),
-  );
-  return watch(events).pipe(Effect.andThen(reestablish.pipe(Effect.repeat(WATCH_RETRY))));
-};
+) =>
+  Effect.gen(function* () {
+    // Consecutive failed attempts, where a healthy watch counts as the first.
+    let failures = 0;
+    for (let attempt = 0; ; attempt += 1) {
+      const startedAt = yield* Clock.currentTimeMillis;
+      yield* (attempt === 0 ? Effect.void : prepare).pipe(
+        Effect.andThen(
+          (attempt === 0 ? events : Stream.concat(Stream.make(undefined), events)).pipe(
+            Stream.debounce(WATCH_DEBOUNCE),
+            Stream.runForEach(() => rescan.pipe(Effect.ignoreCause({ log: true }))),
+          ),
+        ),
+        Effect.ignoreCause({ log: true }),
+      );
+      const upFor = Duration.millis((yield* Clock.currentTimeMillis) - startedAt);
+      failures = Duration.isGreaterThanOrEqualTo(upFor, WATCH_HEALTHY_AFTER) ? 1 : failures + 1;
+      if (failures > 1) yield* Effect.sleep(watchRetryDelay(failures - 2));
+    }
+  });
 
 export const make = Effect.fn("PluginPackageManager.make")(function* (
   options: PluginPackageManagerOptions = {},

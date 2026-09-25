@@ -1640,4 +1640,47 @@ export default async function activate(api) {
       expect(yield* Queue.size(rescans)).toBe(0);
     }),
   );
+
+  it.effect("restarts the backoff after a watch that stayed up", () =>
+    Effect.gen(function* () {
+      const healthy = yield* Queue.unbounded<string, string>();
+      const subscriptions = yield* Queue.unbounded<number>();
+      let subscribed = 0;
+      // Three quick losses grow the backoff, the fourth watch stays up, then losses resume.
+      const watch = Stream.unwrap(
+        Effect.suspend(() => {
+          const attempt = ++subscribed;
+          return Queue.offer(subscriptions, attempt).pipe(Effect.as(attempt));
+        }).pipe(
+          Effect.map((attempt) =>
+            attempt === 4
+              ? Stream.fromQueue(healthy)
+              : attempt >= 6
+                ? Stream.never
+                : Stream.fail("plugins/ deleted"),
+          ),
+        ),
+      );
+      yield* PluginPackageManager.watchPluginsDirectory(watch, Effect.void, Effect.void).pipe(
+        Effect.forkScoped,
+      );
+
+      expect(yield* Queue.take(subscriptions)).toBe(1);
+      expect(yield* Queue.take(subscriptions)).toBe(2);
+      yield* TestClock.adjust("250 millis");
+      expect(yield* Queue.take(subscriptions)).toBe(3);
+      yield* TestClock.adjust("500 millis");
+      expect(yield* Queue.take(subscriptions)).toBe(4);
+
+      // Lost after staying up, the watch comes back at once, and the next loss waits
+      // the shortest backoff again instead of the 1s the earlier losses had reached.
+      yield* TestClock.adjust(PluginPackageManager.WATCH_HEALTHY_AFTER);
+      yield* Queue.fail(healthy, "plugins/ deleted");
+      expect(yield* Queue.take(subscriptions)).toBe(5);
+      yield* TestClock.adjust("249 millis");
+      expect(yield* Queue.size(subscriptions)).toBe(0);
+      yield* TestClock.adjust("1 millis");
+      expect(yield* Queue.take(subscriptions)).toBe(6);
+    }),
+  );
 });
