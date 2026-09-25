@@ -1070,6 +1070,76 @@ it.layer(NodeServices.layer)("plugin failure containment", (it) => {
     }),
   );
 
+  it.effect("answers other plugins' commands while a failed plugin waits to be retired", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3code-plugin-pending-retirement-test-",
+      });
+      const slowPackageId = "com.acme.slow";
+      const hook = yield* startedHook(baseDir);
+      const releaseSymbol = `t3.test.plugin.pending-retirement.release.${baseDir}`;
+      const releaseSlow = Effect.sync(() => {
+        const release = Reflect.get(globalThis, Symbol.for(releaseSymbol));
+        if (typeof release === "function") release();
+      });
+      yield* Effect.acquireRelease(Effect.void, () =>
+        Effect.sync(() => Reflect.deleteProperty(globalThis, Symbol.for(releaseSymbol))),
+      );
+      yield* writePackage(
+        baseDir,
+        packageId,
+        commandId,
+        commandPluginSource("() => { throw new Error('boom') }", `${baseDir}/disposed.log`),
+      );
+      yield* writePackage(baseDir, healthyPackageId, healthyCommandId, healthySource);
+      // Activation holds the manager lock until the test releases it.
+      yield* writePackage(
+        baseDir,
+        slowPackageId,
+        "acme.slow",
+        `export default async function activate() {
+  ${hook.call}
+  await new Promise((resolve) => Reflect.set(globalThis, Symbol.for(${encodeJsonString(releaseSymbol)}), resolve));
+}
+`,
+      );
+
+      yield* useEnvironment(
+        baseDir,
+        Effect.gen(function* () {
+          const manager = yield* PluginPackageManager.PluginPackageManager;
+          const catalog = yield* PluginCommandCatalog.PluginCommandCatalog;
+          yield* manager.enable(healthyPackageId);
+          yield* manager.enable(packageId);
+          const listed = yield* catalog.list;
+
+          const enablingSlow = yield* Effect.forkChild(manager.enable(slowPackageId));
+          yield* Effect.promise(() => hook.started);
+          // The failed command's retirement waits for the lock the slow enable holds.
+          const failing = yield* Effect.forkChild(
+            manager.invokeCommand({ generation: listed.generation, id: commandId }),
+          );
+          expect((yield* manager.status).packages).toMatchObject([
+            { id: healthyPackageId, state: "active" },
+            { id: slowPackageId, state: "idle" },
+            { id: packageId, state: "error" },
+          ]);
+          expect(
+            yield* manager.invokeCommand({ generation: listed.generation, id: healthyCommandId }),
+          ).toEqual({ message: "still healthy", tone: "success" });
+
+          yield* releaseSlow;
+          yield* Fiber.join(enablingSlow);
+          expect((yield* Fiber.await(failing))._tag).toBe("Failure");
+          expect((yield* catalog.list).commands.map((command) => command.id)).not.toContain(
+            commandId,
+          );
+        }).pipe(Effect.ensuring(releaseSlow)),
+      );
+    }),
+  );
+
   it.effect("drops a retired plugin from status once its folder is removed", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;

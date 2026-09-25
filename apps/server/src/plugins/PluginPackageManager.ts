@@ -720,6 +720,7 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
     }
 
     const previous = active.get(id);
+    if (previous !== undefined) failedCommands.delete(previous.definition);
     if (next === undefined) {
       active.delete(id);
     } else {
@@ -906,12 +907,12 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
   );
 
   // A failed command leaves its package enabled but inactive, showing the reason until Reload.
-  const retireFailedCommands = Effect.uninterruptibleMask((restore) =>
-    Effect.gen(function* () {
-      for (const definition of failedCommands) {
-        failedCommands.delete(definition);
+  const retireFailedCommand = (definition: PluginDefinition) =>
+    Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        if (!failedCommands.delete(definition)) return;
         const failed = active.get(definition.id);
-        if (failed?.definition !== definition) continue;
+        if (failed?.definition !== definition) return;
         const { committed, exit } = yield* commit("disable", definition.id, undefined, restore);
         // Rescans leave the unchanged folder alone; Reload or an edit brings it back.
         if (committed) failedFingerprints.set(definition.id, failed.fingerprint);
@@ -921,9 +922,18 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
             error: detailFromCause(exit.cause),
           });
         }
-      }
-    }),
-  );
+      }),
+    );
+
+  /** The live version declaring `commandId`, if one of its commands failed and awaits retirement. */
+  const failedOwnerOf = (commandId: string) =>
+    [...failedCommands].find((definition) => {
+      const owner = active.get(definition.id);
+      return (
+        owner?.definition === definition &&
+        (owner.manifest.contributes?.commands ?? []).some((command) => command.id === commandId)
+      );
+    });
 
   const rescanUnlocked = Effect.fn("PluginPackageManager.rescan")(function* () {
     const discovery = yield* discover("rescan");
@@ -1032,18 +1042,20 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
 
   return {
     status: status("status"),
+    // Only an invocation of the failed plugin retires it, so a pending retirement
+    // never delays other plugins' responses. The failed call returns once its
+    // plugin is retired, so the caller's next catalog read no longer lists it.
     invokeCommand: (input: PluginCommandInvokeInput) =>
-      catalog
-        .invoke(input)
-        .pipe(
-          Effect.ensuring(
-            Effect.suspend(() =>
-              failedCommands.size === 0
-                ? Effect.void
-                : semaphore.withPermits(1)(retireFailedCommands),
-            ),
-          ),
+      catalog.invoke(input).pipe(
+        Effect.ensuring(
+          Effect.suspend(() => {
+            const failed = failedOwnerOf(input.id);
+            return failed === undefined
+              ? Effect.void
+              : semaphore.withPermits(1)(retireFailedCommand(failed));
+          }),
         ),
+      ),
     enable: (id: PluginPackageId) => semaphore.withPermits(1)(transition("enable", id)),
     disable: (id: PluginPackageId) => semaphore.withPermits(1)(disable(id)),
     reload: (id: PluginPackageId) => semaphore.withPermits(1)(transition("reload", id)),
