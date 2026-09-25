@@ -11,7 +11,8 @@ const SemanticVersion = Schema.String.check(
   ),
 );
 
-const CapabilityId = Schema.String.check(Schema.isPattern(/^[a-z0-9][a-z0-9.-]*@[1-9]\d*$/));
+/** A versioned host capability such as `t3.commands@1`. `@0` is experimental. */
+const CapabilityId = Schema.String.check(Schema.isPattern(/^[a-z0-9][a-z0-9.-]*@(?:0|[1-9]\d*)$/));
 
 const RelativeEntrypoint = Schema.String.check(
   Schema.isPattern(/^\.\/(?!(?:\.\.(?:\/|$)|.*\/\.\.(?:\/|$)))[A-Za-z0-9_./-]+$/),
@@ -28,6 +29,11 @@ const ContributionCatalog = Schema.Struct({
 export const PluginManifest = Schema.Struct({
   manifestVersion: Schema.Literal(1),
   id: NamespacedId,
+  /** Display name for Settings; falls back to `id`. */
+  name: Schema.optional(Schema.String.check(Schema.isNonEmpty(), Schema.isMaxLength(100))),
+  description: Schema.optional(Schema.String.check(Schema.isMaxLength(500))),
+  /** Package-relative SVG or PNG shown next to the name in Settings. */
+  icon: Schema.optional(RelativeEntrypoint),
   version: SemanticVersion,
   apiVersion: Schema.Literal(1),
   surfaces: Schema.optional(Schema.Array(Schema.Literals(["web", "desktop", "mobile"]))),

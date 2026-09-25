@@ -17,7 +17,6 @@ import {
   DEFAULT_SERVER_SETTINGS,
   ModelSelection,
   ProjectScript,
-  type PluginPackageId,
   type ProjectSettingsOverrides,
   type ProviderInstanceConfig,
   type ProviderInstanceEnvironmentVariable,
@@ -207,11 +206,6 @@ export class ServerSettingsService extends Context.Service<
       patch: ServerSettingsPatch,
     ) => Effect.Effect<ServerSettings, ServerSettingsError>;
 
-    /** Replace the internal environment-scoped plugin enablement set. */
-    readonly setEnabledPluginIds: (
-      ids: ReadonlyArray<PluginPackageId>,
-    ) => Effect.Effect<ServerSettings, ServerSettingsError>;
-
     /** Stream of settings change events. */
     readonly streamChanges: Stream.Stream<ServerSettings>;
 
@@ -254,11 +248,6 @@ const makeTest = (overrides: DeepPartial<ServerSettings> = {}) =>
           Effect.tap((nextSettings) => Ref.set(currentSettingsRef, nextSettings)),
           Effect.map(resolveTextGenerationProvider),
         ),
-      setEnabledPluginIds: (ids) =>
-        Ref.updateAndGet(currentSettingsRef, (current) => ({
-          ...current,
-          enabledPluginIds: [...ids],
-        })).pipe(Effect.map(resolveTextGenerationProvider)),
       streamChanges: Stream.empty,
       subscribeChanges: Effect.succeed(Stream.empty),
     } satisfies ServerSettingsService["Service"];
@@ -951,13 +940,13 @@ const make = Effect.gen(function* () {
     );
   };
 
-  const mutateSettings = (
-    mutate: (current: ServerSettings) => ServerSettings,
+  const updateSettings = (
+    patch: ServerSettingsPatch,
   ): Effect.Effect<ServerSettings, ServerSettingsError> =>
     writeSemaphore.withPermits(1)(
       Effect.gen(function* () {
         const current = yield* getSettingsFromCache;
-        const updated = mutate(current);
+        const updated = applyServerSettingsPatch(current, patch);
         const persisted = yield* persistProviderEnvironmentSecrets(current, updated);
         const next = yield* normalizeServerSettings(persisted.settings);
         const materialized = yield* Effect.uninterruptibleMask(() =>
@@ -1061,10 +1050,7 @@ const make = Effect.gen(function* () {
       Effect.flatMap(materializeProviderEnvironmentSecrets),
       Effect.map(resolveTextGenerationProvider),
     ),
-    updateSettings: (patch) =>
-      mutateSettings((current) => applyServerSettingsPatch(current, patch)),
-    setEnabledPluginIds: (ids) =>
-      mutateSettings((current) => ({ ...current, enabledPluginIds: [...ids] })),
+    updateSettings,
     get streamChanges() {
       return materializeChanges(Stream.fromPubSub(changesPubSub));
     },

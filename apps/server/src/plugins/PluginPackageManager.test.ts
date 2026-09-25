@@ -1,5 +1,4 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { ServerSettingsError } from "@t3tools/contracts";
 import { it } from "@effect/vitest";
 import { expect } from "vite-plus/test";
 import * as Effect from "effect/Effect";
@@ -11,9 +10,7 @@ import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import { PluginManifest } from "@t3tools/plugin-runtime/manifest";
 
-import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as ServerConfig from "../config.ts";
-import * as ServerSettings from "../serverSettings.ts";
 import * as PluginCommandCatalog from "./PluginCommandCatalog.ts";
 import * as PluginPackageManager from "./PluginPackageManager.ts";
 
@@ -32,11 +29,25 @@ const manifest = {
 
 const encodeManifest = Schema.encodeSync(Schema.fromJsonString(PluginManifest));
 const encodeJsonString = Schema.encodeSync(Schema.fromJsonString(Schema.String));
-const decodePersistedEnabledPlugins = Schema.decodeUnknownSync(
-  Schema.fromJsonString(
-    Schema.Struct({ enabledPluginIds: Schema.optional(Schema.Array(Schema.String)) }),
-  ),
+const decodePluginState = Schema.decodeUnknownSync(
+  Schema.fromJsonString(Schema.Struct({ enabled: Schema.Array(Schema.String) })),
 );
+const readEnabledIds = (baseDir: string) =>
+  FileSystem.FileSystem.pipe(
+    Effect.flatMap((fileSystem) => fileSystem.readFileString(`${baseDir}/userdata/plugins.json`)),
+    Effect.map((contents) => decodePluginState(contents).enabled),
+  );
+/** Runs `effect` while the state directory rejects writes, so persisting enabled state fails. */
+const withReadOnlyStateDir = <A, E, R>(
+  fileSystem: FileSystem.FileSystem,
+  baseDir: string,
+  effect: Effect.Effect<A, E, R>,
+) =>
+  Effect.acquireUseRelease(
+    fileSystem.chmod(`${baseDir}/userdata`, 0o555),
+    () => effect,
+    () => fileSystem.chmod(`${baseDir}/userdata`, 0o755).pipe(Effect.orDie),
+  );
 
 const pluginSource = (disposalFile: string, message = "External plugin runtime is active.") => `
 import { appendFile } from "node:fs/promises";
@@ -102,58 +113,10 @@ export default function activate(api) {
 }
 `;
 
-interface EnvironmentLayerOptions {
-  readonly persistenceFailures?: { remaining: number };
-  readonly startupFailure?: boolean;
-}
-
-const makeEnvironmentLayer = (baseDir: string, options?: EnvironmentLayerOptions) => {
+const makeEnvironmentLayer = (baseDir: string) => {
   const configLayer = Layer.fresh(ServerConfig.layerTest(process.cwd(), baseDir));
-  const liveSettingsLayer = ServerSettings.layer.pipe(
-    Layer.provide(ServerSecretStore.layer),
-    Layer.provideMerge(configLayer),
-  );
-  const persistenceFailures = options?.persistenceFailures;
-  const startupFailure = options?.startupFailure === true;
-  const settingsLayer =
-    persistenceFailures === undefined && !startupFailure
-      ? liveSettingsLayer
-      : Layer.effect(
-          ServerSettings.ServerSettingsService,
-          Effect.gen(function* () {
-            const live = yield* ServerSettings.ServerSettingsService;
-            return ServerSettings.ServerSettingsService.of({
-              ...live,
-              start: startupFailure
-                ? Effect.fail(
-                    new ServerSettingsError({
-                      cause: new Error("injected startup failure"),
-                      operation: "read-file",
-                      settingsPath: `${baseDir}/userdata/settings.json`,
-                    }),
-                  )
-                : live.start,
-              setEnabledPluginIds: (ids) =>
-                Effect.suspend(() => {
-                  if (persistenceFailures !== undefined && persistenceFailures.remaining > 0) {
-                    persistenceFailures.remaining -= 1;
-                    return Effect.fail(
-                      new ServerSettingsError({
-                        cause: new Error("injected persistence failure"),
-                        operation: "write-file",
-                        settingsPath: `${baseDir}/userdata/settings.json`,
-                      }),
-                    );
-                  }
-                  return live.setEnabledPluginIds(ids);
-                }),
-            });
-          }),
-        ).pipe(Layer.provide(liveSettingsLayer));
-
   return PluginPackageManager.layer.pipe(
     Layer.provideMerge(PluginCommandCatalog.layer),
-    Layer.provideMerge(settingsLayer),
     Layer.provideMerge(configLayer),
   );
 };
@@ -165,16 +128,17 @@ const useEnvironment = <A, E>(
     E,
     PluginPackageManager.PluginPackageManager | PluginCommandCatalog.PluginCommandCatalog
   >,
-  options?: EnvironmentLayerOptions,
-) => Effect.scoped(effect.pipe(Effect.provide(makeEnvironmentLayer(baseDir, options))));
+) => Effect.scoped(effect.pipe(Effect.provide(makeEnvironmentLayer(baseDir))));
 
 it.layer(NodeServices.layer)("plugin package lifecycle", (it) => {
-  it.effect("keeps the environment available when package manager startup fails", () =>
+  it.effect("keeps the environment available when plugin state is unreadable", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
       const baseDir = yield* fileSystem.makeTempDirectoryScoped({
         prefix: "t3code-plugin-package-startup-failure-test-",
       });
+      yield* fileSystem.makeDirectory(`${baseDir}/userdata`, { recursive: true });
+      yield* fileSystem.writeFileString(`${baseDir}/userdata/plugins.json`, "{ not json");
 
       const exit = yield* Effect.exit(
         useEnvironment(
@@ -183,7 +147,6 @@ it.layer(NodeServices.layer)("plugin package lifecycle", (it) => {
             const manager = yield* PluginPackageManager.PluginPackageManager;
             return yield* Effect.exit(manager.status);
           }),
-          { startupFailure: true },
         ),
       );
 
@@ -264,11 +227,7 @@ it.layer(NodeServices.layer)("plugin package lifecycle", (it) => {
         }),
       );
 
-      expect(
-        decodePersistedEnabledPlugins(
-          yield* fileSystem.readFileString(`${baseDir}/userdata/settings.json`),
-        ).enabledPluginIds,
-      ).toEqual([packageId]);
+      expect(yield* readEnabledIds(baseDir)).toEqual([packageId]);
 
       yield* useEnvironment(
         baseDir,
@@ -290,10 +249,52 @@ it.layer(NodeServices.layer)("plugin package lifecycle", (it) => {
         }),
       );
 
-      const persisted = yield* fileSystem.readFileString(`${baseDir}/userdata/settings.json`);
-      expect(decodePersistedEnabledPlugins(persisted).enabledPluginIds ?? []).toEqual([]);
+      expect(yield* readEnabledIds(baseDir)).toEqual([]);
       expect(yield* fileSystem.readFileString(`${packageDirectory}/disposed.log`)).toBe(
         "disposed\ndisposed\n",
+      );
+    }),
+  );
+
+  it.effect("reports display names and inlines package icons", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3code-plugin-package-display-test-",
+      });
+      const namedDirectory = `${baseDir}/userdata/plugins/named`;
+      const unnamedDirectory = `${baseDir}/userdata/plugins/unnamed`;
+      yield* fileSystem.makeDirectory(namedDirectory, { recursive: true });
+      yield* fileSystem.makeDirectory(unnamedDirectory, { recursive: true });
+      yield* fileSystem.writeFileString(
+        `${namedDirectory}/t3-plugin.json`,
+        encodeManifest({
+          ...manifest,
+          name: "Runtime status",
+          description: "Shows runtime status.",
+          icon: "./icon.svg",
+        }),
+      );
+      yield* fileSystem.writeFileString(`${namedDirectory}/icon.svg`, "<svg/>");
+      yield* fileSystem.writeFileString(
+        `${unnamedDirectory}/t3-plugin.json`,
+        encodeManifest({ ...manifest, id: "com.acme.unnamed", icon: "./missing.svg" }),
+      );
+
+      yield* useEnvironment(
+        baseDir,
+        Effect.gen(function* () {
+          const manager = yield* PluginPackageManager.PluginPackageManager;
+          const { packages } = yield* manager.status;
+          expect(packages.find((entry) => entry.id === packageId)).toMatchObject({
+            name: "Runtime status",
+            description: "Shows runtime status.",
+            iconUrl: `data:image/svg+xml;base64,${Buffer.from("<svg/>").toString("base64")}`,
+          });
+          const unnamed = packages.find((entry) => entry.id === "com.acme.unnamed");
+          expect(unnamed?.name).toBe("com.acme.unnamed");
+          expect(unnamed?.iconUrl).toBeUndefined();
+        }),
       );
     }),
   );
@@ -420,7 +421,7 @@ it.layer(NodeServices.layer)("plugin package lifecycle", (it) => {
     }),
   );
 
-  it.effect("keeps runtime and persisted enablement aligned when settings writes fail", () =>
+  it.effect("keeps runtime and persisted enablement aligned when state writes fail", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
       const baseDir = yield* fileSystem.makeTempDirectoryScoped({
@@ -442,7 +443,12 @@ it.layer(NodeServices.layer)("plugin package lifecycle", (it) => {
         Effect.gen(function* () {
           const manager = yield* PluginPackageManager.PluginPackageManager;
           const catalog = yield* PluginCommandCatalog.PluginCommandCatalog;
-          expect((yield* Effect.exit(manager.enable(packageId)))._tag).toBe("Failure");
+          const enabled = yield* withReadOnlyStateDir(
+            fileSystem,
+            baseDir,
+            Effect.exit(manager.enable(packageId)),
+          );
+          expect(enabled._tag).toBe("Failure");
           expect((yield* catalog.list).commands.map((command) => command.id)).not.toContain(
             commandId,
           );
@@ -450,7 +456,6 @@ it.layer(NodeServices.layer)("plugin package lifecycle", (it) => {
             packages: [{ id: packageId, enabled: false }],
           });
         }),
-        { persistenceFailures: { remaining: 1 } },
       );
 
       yield* useEnvironment(
@@ -466,13 +471,17 @@ it.layer(NodeServices.layer)("plugin package lifecycle", (it) => {
         Effect.gen(function* () {
           const manager = yield* PluginPackageManager.PluginPackageManager;
           const catalog = yield* PluginCommandCatalog.PluginCommandCatalog;
-          expect((yield* Effect.exit(manager.disable(packageId)))._tag).toBe("Failure");
+          const disabled = yield* withReadOnlyStateDir(
+            fileSystem,
+            baseDir,
+            Effect.exit(manager.disable(packageId)),
+          );
+          expect(disabled._tag).toBe("Failure");
           expect((yield* catalog.list).commands.map((command) => command.id)).toContain(commandId);
           expect(yield* manager.status).toMatchObject({
             packages: [{ id: packageId, enabled: true, state: "active" }],
           });
         }),
-        { persistenceFailures: { remaining: 1 } },
       );
     }),
   );
@@ -603,8 +612,7 @@ it.layer(NodeServices.layer)("plugin package lifecycle", (it) => {
           );
         }),
       );
-      const persisted = yield* fileSystem.readFileString(`${baseDir}/userdata/settings.json`);
-      expect(decodePersistedEnabledPlugins(persisted).enabledPluginIds ?? []).toEqual([]);
+      expect(yield* readEnabledIds(baseDir)).toEqual([]);
     }),
   );
 });

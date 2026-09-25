@@ -8,12 +8,14 @@ export const PluginPackageId = Schema.String.check(
 );
 export type PluginPackageId = typeof PluginPackageId.Type;
 
+/** A versioned host capability such as `t3.commands@1`. `@0` is experimental. */
 export const PluginPackageCapability = Schema.String.check(
-  Schema.isPattern(/^[a-z0-9][a-z0-9.-]*@[1-9]\d*$/),
+  Schema.isPattern(/^[a-z0-9][a-z0-9.-]*@(?:0|[1-9]\d*)$/),
 );
 export type PluginPackageCapability = typeof PluginPackageCapability.Type;
 
-export const PluginPackageState = Schema.Literals(["disabled", "active", "error"]);
+/** `idle` is enabled but not currently activated. */
+export const PluginPackageState = Schema.Literals(["disabled", "idle", "active", "error"]);
 export type PluginPackageState = typeof PluginPackageState.Type;
 
 export const PluginPackageContributions = Schema.Struct({
@@ -23,12 +25,18 @@ export type PluginPackageContributions = typeof PluginPackageContributions.Type;
 
 export const PluginPackageStatus = Schema.Struct({
   id: PluginPackageId,
+  name: TrimmedNonEmptyString,
+  description: Schema.optional(Schema.String),
+  /** A `data:` URL, inlined so remote clients need no extra authenticated fetch. */
+  iconUrl: Schema.optional(Schema.String),
   version: TrimmedNonEmptyString,
   apiVersion: Schema.Literal(1),
   enabled: Schema.Boolean,
   state: PluginPackageState,
   capabilities: Schema.Array(PluginPackageCapability),
   contributions: PluginPackageContributions,
+  /** The T3 version in which a deprecated capability this plugin requires stops working. */
+  olderApiRemovedIn: Schema.optional(TrimmedNonEmptyString),
   error: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(2_000))),
 });
 export type PluginPackageStatus = typeof PluginPackageStatus.Type;
