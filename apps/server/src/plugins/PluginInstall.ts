@@ -55,7 +55,7 @@ const readPluginManifest = Effect.fn("PluginInstall.readPluginManifest")(functio
         }),
     ),
   );
-  if (manifest.entrypoints.server === undefined) {
+  if (manifest.entrypoints?.server === undefined) {
     return yield* new PluginInstallError({ detail: "manifest must define entrypoints.server" });
   }
   return manifest;
@@ -67,7 +67,7 @@ const validatePackage = Effect.fn("PluginInstall.validatePackage")(function* (ro
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const manifest = yield* readPluginManifest(root);
-  const entrypoint = path.resolve(root, manifest.entrypoints.server ?? "");
+  const entrypoint = path.resolve(root, manifest.entrypoints?.server ?? "");
   const relative = path.relative(root, entrypoint);
   if (relative.startsWith("..") || path.isAbsolute(relative)) {
     return yield* new PluginInstallError({ detail: "entrypoints.server escapes the package" });
@@ -75,7 +75,7 @@ const validatePackage = Effect.fn("PluginInstall.validatePackage")(function* (ro
   const exists = yield* fileSystem.exists(entrypoint).pipe(Effect.orElseSucceed(() => false));
   if (!exists) {
     return yield* new PluginInstallError({
-      detail: `entrypoints.server ${manifest.entrypoints.server} does not exist`,
+      detail: `entrypoints.server ${manifest.entrypoints?.server} does not exist`,
     });
   }
   return manifest;

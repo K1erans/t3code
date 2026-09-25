@@ -8,42 +8,65 @@ const decodeManifest = Schema.decodeUnknownSync(PluginManifest);
 const validManifest = {
   manifestVersion: 1,
   id: "com.acme.linear",
+  name: "Linear",
   version: "1.2.0",
-  apiVersion: 1,
-  entrypoints: {
-    server: "./dist/server.js",
-    web: "./dist/web.js",
-  },
-  capabilities: ["t3.commands@1"],
-  requires: ["t3.commands@1", "t3.secrets@1"],
-  provides: ["com.acme.linear@1"],
-  permissions: ["network:https://api.linear.app", "secrets:linear-token"],
+  requires: ["t3.commands@0", "t3.storage@0"],
+  surfaces: ["web", "desktop"],
+  entrypoints: { server: "./dist/server.js" },
   contributes: {
-    commands: ["linear.create-issue"],
-    settings: ["linear.settings"],
-    views: ["thread.right-panel"],
+    commands: [{ id: "linear.create-issue", title: "Linear: create issue" }],
   },
 };
 
 describe("PluginManifest", () => {
-  it("decodes a versioned namespaced multi-surface plugin manifest", () => {
+  it("decodes a versioned namespaced plugin manifest", () => {
     expect(decodeManifest(validManifest)).toEqual(validManifest);
   });
 
-  it("rejects unsupported manifest and api versions", () => {
-    expect(() => decodeManifest({ ...validManifest, manifestVersion: 2 })).toThrow();
-    expect(() => decodeManifest({ ...validManifest, apiVersion: 2 })).toThrow();
-    expect(() => decodeManifest({ ...validManifest, engines: { t3: "^0.1.0" } })).toThrow();
+  it("requires only the identity, name, version and requirements", () => {
+    const minimal = {
+      manifestVersion: 1,
+      id: "com.acme.minimal",
+      name: "Minimal",
+      version: "0.1.0",
+      requires: [],
+    };
+    expect(decodeManifest(minimal)).toEqual(minimal);
+    const { name: _name, ...withoutName } = minimal;
+    expect(() => decodeManifest(withoutName)).toThrow();
+    const { requires: _requires, ...withoutRequires } = minimal;
+    expect(() => decodeManifest(withoutRequires)).toThrow();
   });
 
-  it("rejects unnamespaced plugin and contribution ids", () => {
+  it("rejects unsupported manifest versions and fields outside the manifest", () => {
+    expect(() => decodeManifest({ ...validManifest, manifestVersion: 2 })).toThrow();
+    for (const field of ["apiVersion", "capabilities", "permissions", "provides", "engines"]) {
+      expect(() => decodeManifest({ ...validManifest, [field]: [] })).toThrow();
+    }
+    for (const contribution of ["mobileCards", "views", "settings"]) {
+      expect(() =>
+        decodeManifest({
+          ...validManifest,
+          contributes: { ...validManifest.contributes, [contribution]: [] },
+        }),
+      ).toThrow();
+    }
+  });
+
+  it("rejects unnamespaced plugin and command ids and untitled commands", () => {
     expect(() => decodeManifest({ ...validManifest, id: "linear" })).toThrow();
     expect(() => decodeManifest({ ...validManifest, id: `com.${"a".repeat(252)}` })).toThrow();
     expect(() =>
       decodeManifest({
         ...validManifest,
-        contributes: { ...validManifest.contributes, commands: ["create-issue"] },
+        contributes: { commands: [{ id: "create-issue", title: "Create issue" }] },
       }),
+    ).toThrow();
+    expect(() =>
+      decodeManifest({ ...validManifest, contributes: { commands: ["linear.create-issue"] } }),
+    ).toThrow();
+    expect(() =>
+      decodeManifest({ ...validManifest, contributes: { commands: [{ id: "linear.x" }] } }),
     ).toThrow();
   });
 
@@ -61,32 +84,19 @@ describe("PluginManifest", () => {
     ]);
   });
 
-  it("rejects entrypoints that escape the plugin directory", () => {
+  it("allows only a server entrypoint, inside the plugin directory", () => {
     for (const server of ["./../outside.js", "./dist/../../outside.js"]) {
+      expect(() => decodeManifest({ ...validManifest, entrypoints: { server } })).toThrow();
+    }
+    for (const surface of ["web", "desktop", "mobile"]) {
       expect(() =>
         decodeManifest({
           ...validManifest,
-          entrypoints: { ...validManifest.entrypoints, server },
+          entrypoints: { ...validManifest.entrypoints, [surface]: "./dist/client.js" },
         }),
       ).toThrow();
     }
-  });
-
-  it("keeps mobile declarative by excluding a mobile executable entrypoint", () => {
-    const decoded = decodeManifest({
-      ...validManifest,
-      surfaces: ["web", "desktop", "mobile"],
-      contributes: { ...validManifest.contributes, mobileCards: ["linear.summary"] },
-    });
-
-    expect(decoded.surfaces).toEqual(["web", "desktop", "mobile"]);
-    expect(decoded.contributes.mobileCards).toEqual(["linear.summary"]);
-    expect(decoded.entrypoints).not.toHaveProperty("mobile");
-    expect(() =>
-      decodeManifest({
-        ...validManifest,
-        entrypoints: { ...validManifest.entrypoints, mobile: "./dist/mobile.js" },
-      }),
-    ).toThrow();
+    const { entrypoints: _entrypoints, ...withoutEntrypoints } = validManifest;
+    expect(decodeManifest(withoutEntrypoints).entrypoints).toBeUndefined();
   });
 });
