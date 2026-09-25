@@ -224,7 +224,9 @@ it.layer(NodeServices.layer)("plugin package lifecycle", (it) => {
           const manager = yield* PluginPackageManager.PluginPackageManager;
           const catalog = yield* PluginCommandCatalog.PluginCommandCatalog;
           const status = yield* manager.status;
-          expect(status.packages).toMatchObject([{ id: packageId, enabled: true, state: "idle" }]);
+          expect(status.packages).toMatchObject([
+            { id: packageId, enabled: true, state: "activating" },
+          ]);
           expect(status.packages[0]?.error).toBeUndefined();
           const listed = yield* catalog.list;
           expect(listed.commands.map((command) => command.id)).not.toContain(commandId);
@@ -862,11 +864,18 @@ const startedHook = (baseDir: string) =>
   );
 
 /**
- * Runs `effect` until plugin code has started, then lets the entry point timeout
- * elapse, and completes with `effect`'s own result.
+ * Runs `effect` and completes with its own result. For an entry point that times
+ * out, first lets the entry point timeout elapse once plugin code has started.
+ * Other outcomes leave the clock alone, so it cannot time out the cleanup that
+ * follows a failure.
  */
-const runPastTimeout = <A, E, R>(effect: Effect.Effect<A, E, R>, started: Promise<void>) =>
+const runPastTimeout = <A, E, R>(
+  effect: Effect.Effect<A, E, R>,
+  started: Promise<void>,
+  outcome: string = "timed out",
+) =>
   Effect.gen(function* () {
+    if (outcome !== "timed out") return yield* effect;
     const fiber = yield* Effect.forkChild(effect);
     yield* Effect.promise(() => started);
     yield* TestClock.adjust(entryPointTimeout);
@@ -931,7 +940,7 @@ it.layer(NodeServices.layer)("plugin failure containment", (it) => {
             const catalog = yield* PluginCommandCatalog.PluginCommandCatalog;
             yield* manager.enable(healthyPackageId);
             const enabled = yield* Effect.exit(
-              runPastTimeout(manager.enable(packageId), hook.started),
+              runPastTimeout(manager.enable(packageId), hook.started, outcome),
             );
             expect(enabled._tag).toBe("Failure");
 
@@ -986,6 +995,7 @@ it.layer(NodeServices.layer)("plugin failure containment", (it) => {
               runPastTimeout(
                 manager.invokeCommand({ generation: listed.generation, id: commandId }),
                 hook.started,
+                outcome,
               ),
             );
             const reason = `command ${commandId} ${outcome}: ${expectedMessage(outcome)}`;

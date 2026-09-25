@@ -16,6 +16,7 @@ import type { PluginActivationContext, PluginDefinition } from "@t3tools/plugin-
 import type { PluginManifest } from "@t3tools/plugin-runtime/manifest";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
+import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -372,6 +373,8 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
   const entryPointTimeout = Duration.fromInputUnsafe(options.entryPointTimeout ?? "30 seconds");
   const runEntryPoint = Effect.runPromiseWith(yield* Effect.context<never>());
   let loadSequence = 0;
+  // True until startup activation has run, so enabled packages it has not reached show as starting.
+  let starting = true;
 
   // The one wrapper around every call into plugin code (activate, commands, dispose).
   // The reason goes into the package status; the stack stays in the server log.
@@ -793,15 +796,15 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
         ...(iconUrl === undefined ? {} : { iconUrl }),
         version: packageManifest.version,
         enabled,
-        // Enabled without a live version or an error means activation has not
-        // run yet, as while startup activation is still in progress.
         state:
           error !== undefined
             ? "error"
             : current !== undefined
               ? "active"
               : enabled
-                ? "idle"
+                ? starting
+                  ? "activating"
+                  : "idle"
                 : "disabled",
         requires: [...packageManifest.requires],
         contributions: {
@@ -993,9 +996,25 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
   const rescan = semaphore.withPermits(1)(rescanUnlocked());
   // Forked after the shutdown finalizer so they are interrupted first and cannot
   // load anything once shutdown has retired the packages. Plugins never delay
-  // server startup: enabled packages activate in the background, showing Idle
-  // until they do, through the same rescan that picks up later changes.
-  yield* rescan.pipe(Effect.ignoreCause({ log: true }), Effect.forkScoped);
+  // server startup: enabled packages activate in the background, showing as
+  // starting until they do, through the same rescan that picks up later changes.
+  // Startup holds the lock before the service is returned, so every lifecycle
+  // action queues behind it.
+  const startupLocked = yield* Deferred.make<void>();
+  yield* semaphore
+    .withPermits(1)(
+      Deferred.succeed(startupLocked, undefined).pipe(Effect.andThen(rescanUnlocked())),
+    )
+    .pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          starting = false;
+        }),
+      ),
+      Effect.ignoreCause({ log: true }),
+      Effect.forkScoped,
+    );
+  yield* Deferred.await(startupLocked);
   yield* watchPluginsDirectory(
     watchEvents(fileSystem, pluginsDirectory),
     fileSystem.makeDirectory(pluginsDirectory, { recursive: true }),

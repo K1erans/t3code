@@ -14,8 +14,17 @@ export const PluginPackageCapability = Schema.String.check(
 );
 export type PluginPackageCapability = typeof PluginPackageCapability.Type;
 
-/** `idle` is enabled but not currently activated. */
-export const PluginPackageState = Schema.Literals(["disabled", "idle", "active", "error"]);
+/**
+ * `activating` is enabled and waiting for startup activation to reach it; `idle`
+ * is enabled but not currently activated.
+ */
+export const PluginPackageState = Schema.Literals([
+  "disabled",
+  "activating",
+  "idle",
+  "active",
+  "error",
+]);
 export type PluginPackageState = typeof PluginPackageState.Type;
 
 export const PluginPackageContributions = Schema.Struct({

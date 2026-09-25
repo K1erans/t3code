@@ -41,7 +41,7 @@ identity: only a failure from the version that is still active marks the package
 it. A disposed runtime starts no new invocations.
 
 For the same reason, plugins never delay server startup. Enabled packages activate in a background
-rescan and show as Idle until they do.
+rescan and show as Starting until they do.
 
 ## Mobile in v0
 

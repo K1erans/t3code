@@ -10,9 +10,10 @@ import {
 
 describe("pluginStatusBadges", () => {
   it("labels each lifecycle state", () => {
-    const label = (state: "active" | "idle" | "disabled" | "error") =>
+    const label = (state: "active" | "activating" | "idle" | "disabled" | "error") =>
       pluginStatusBadges({ state, requires: [] }).map((badge) => badge.label);
     expect(label("active")).toEqual(["Active"]);
+    expect(label("activating")).toEqual(["Starting…"]);
     expect(label("idle")).toEqual(["Idle"]);
     expect(label("disabled")).toEqual(["Disabled"]);
     expect(label("error")).toEqual(["Error"]);

@@ -7,6 +7,7 @@ export interface PluginStatusBadge {
 
 const STATE_BADGES: Record<PluginPackageStatus["state"], PluginStatusBadge> = {
   active: { label: "Active", variant: "success" },
+  activating: { label: "Starting…", variant: "secondary" },
   idle: { label: "Idle", variant: "secondary" },
   disabled: { label: "Disabled", variant: "secondary" },
   error: { label: "Error", variant: "error" },
