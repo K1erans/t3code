@@ -11,7 +11,7 @@ const SemanticVersion = Schema.String.check(
   ),
 );
 
-const CapabilityId = Schema.String.check(Schema.isPattern(/^[a-z0-9][a-z0-9.-]*@[1-9]\d*$/));
+const CapabilityId = Schema.String.check(Schema.isPattern(/^[a-z0-9][a-z0-9.-]*@(?:0|[1-9]\d*)$/));
 
 const RelativeEntrypoint = Schema.String.check(
   Schema.isPattern(/^\.\/(?!(?:\.\.(?:\/|$)|.*\/\.\.(?:\/|$)))[A-Za-z0-9_./-]+$/),

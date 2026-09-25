@@ -9,7 +9,7 @@ export const PluginPackageId = Schema.String.check(
 export type PluginPackageId = typeof PluginPackageId.Type;
 
 export const PluginPackageCapability = Schema.String.check(
-  Schema.isPattern(/^[a-z0-9][a-z0-9.-]*@[1-9]\d*$/),
+  Schema.isPattern(/^[a-z0-9][a-z0-9.-]*@(?:0|[1-9]\d*)$/),
 );
 export type PluginPackageCapability = typeof PluginPackageCapability.Type;
 
