@@ -19,6 +19,6 @@ environment with a custom data directory. npm package names and uploads from a b
 supported.
 
 A running server picks up changes without a restart. New plugins appear disabled in
-**Settings → Plugins**; enable them there. An enabled plugin reloads when you reinstall it, and a
-removed plugin shows as not installed until you install it again. If a change does not show up, use
-**Rescan** in Settings → Plugins.
+**Settings → Plugins**; enable them there. An enabled plugin reloads when you reinstall it, and if
+you remove it, it shows as not installed until you install it again. A removed disabled plugin
+simply leaves the list. If a change does not show up, use **Rescan** in Settings → Plugins.
