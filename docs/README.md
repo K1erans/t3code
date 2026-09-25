@@ -14,6 +14,7 @@
 - [SnapShots](./user/snap-shot.md)
 - [Import browser sessions](./user/browser-import.md)
 - [Devices](./user/devices.md)
+- [Plugins](./user/plugins.md)
 - [Usage and limits](./user/usage.md)
 - [Product usage data](./user/telemetry.md)
 - [Remote access](./user/remote-access.md)
@@ -50,6 +51,7 @@ source alone does not explain. Most code changes do not need an internal documen
 - [Terminal runtime](./internals/terminal-runtime.md)
 - [Devices](./internals/devices.md)
 - [Voice input](./internals/voice-input.md)
+- [Plugins](./internals/plugins.md)
 
 ### Runbooks
 

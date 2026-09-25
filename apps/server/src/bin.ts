@@ -11,6 +11,7 @@ import { authCommand } from "./cli/auth.ts";
 import { appCommand } from "./cli/app.ts";
 import { connectCommand } from "./cli/connect.ts";
 import { pairCommand } from "./cli/pair.ts";
+import { pluginCommand } from "./cli/plugin.ts";
 import { hasCloudPublicConfig } from "./cloud/publicConfig.ts";
 import { sharedServerCommandFlags } from "./cli/config.ts";
 import { isEntrypoint } from "./entrypoint.ts";
@@ -71,6 +72,7 @@ export const makeCli = ({ cloudEnabled = hasCloudPublicConfig } = {}) =>
       servicePreflightCommand,
       sshHelperCommand,
       themeCommand,
+      pluginCommand,
       triageCommand,
       cloudEnabled ? connectCommand : connectUnavailableCommand,
     ]),

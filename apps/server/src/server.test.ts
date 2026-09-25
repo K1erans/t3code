@@ -6484,6 +6484,65 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect("lists, subscribes to, and invokes plugin commands over websocket rpc", () =>
+    Effect.gen(function* () {
+      yield* buildAppUnderTest();
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const result = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          Effect.gen(function* () {
+            const listed = yield* client[WS_METHODS.pluginCommandsList]({});
+            const streamed = yield* client[WS_METHODS.subscribePluginCommands]({}).pipe(
+              Stream.runHead,
+              Effect.map(Option.getOrThrow),
+            );
+            const missing = yield* Effect.flip(
+              client[WS_METHODS.pluginCommandsInvoke]({
+                generation: listed.generation,
+                id: "com.acme.missing",
+              }),
+            );
+            return { listed, missing, streamed };
+          }),
+        ),
+      );
+
+      // No plugins are installed, so there are no commands.
+      assert.deepEqual(result.listed, { commands: [], generation: 0 });
+      assert.deepEqual(result.streamed, result.listed);
+      assert.deepInclude(result.missing, {
+        _tag: "PluginCommandNotFoundError",
+        id: "com.acme.missing",
+      });
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("routes plugin package status and lifecycle errors over websocket rpc", () =>
+    Effect.gen(function* () {
+      yield* buildAppUnderTest();
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const result = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          Effect.gen(function* () {
+            const status = yield* client[WS_METHODS.pluginPackagesStatus]({});
+            const missing = yield* Effect.flip(
+              client[WS_METHODS.pluginPackagesEnable]({ id: "com.acme.missing" }),
+            );
+            return { missing, status };
+          }),
+        ),
+      );
+
+      assert.deepEqual(result.status, { errors: [], packages: [] });
+      assert.deepInclude(result.missing, {
+        _tag: "PluginPackageNotFoundError",
+        id: "com.acme.missing",
+      });
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect("routes websocket rpc subscribeServerConfig streams snapshot then update", () =>
     Effect.gen(function* () {
       const path = yield* Path.Path;
