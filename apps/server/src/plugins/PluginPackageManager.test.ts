@@ -708,6 +708,63 @@ it.layer(NodeServices.layer)("plugin package pickup", (it) => {
     }),
   );
 
+  it.effect("reloads in-place code edits and retries failed loads on rescan", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3code-plugin-package-edit-test-",
+      });
+      const packageDirectory = `${baseDir}/userdata/plugins/${packageId}`;
+      const failSymbol = `t3.test.plugin.edit.fail.${baseDir}`;
+      let editTime = 1_767_225_600; // seconds, as utimes expects for numbers
+      // Edits a nested module in place; mtimes are set explicitly so the test never races the clock.
+      const writeMessage = Effect.fn(function* (message: string) {
+        const file = `${packageDirectory}/message.mjs`;
+        yield* fileSystem.writeFileString(
+          file,
+          `if (Reflect.get(globalThis, Symbol.for(${encodeJsonString(failSymbol)}))) throw new Error("not ready");\nexport const message = ${encodeJsonString(message)};\n`,
+        );
+        editTime += 60;
+        yield* fileSystem.utimes(file, editTime, editTime);
+      });
+      yield* fileSystem.makeDirectory(packageDirectory, { recursive: true });
+      yield* fileSystem.writeFileString(
+        `${packageDirectory}/t3-plugin.json`,
+        encodeManifest(manifest),
+      );
+      yield* fileSystem.writeFileString(`${packageDirectory}/index.mjs`, pluginSourceWithHelper);
+      yield* writeMessage("one");
+
+      yield* useEnvironment(
+        baseDir,
+        Effect.gen(function* () {
+          const manager = yield* PluginPackageManager.PluginPackageManager;
+          const catalog = yield* PluginCommandCatalog.PluginCommandCatalog;
+          const invoke = Effect.gen(function* () {
+            const listed = yield* catalog.list;
+            return yield* catalog.invoke({ generation: listed.generation, id: commandId });
+          });
+          yield* manager.enable(packageId);
+          expect(yield* invoke).toMatchObject({ message: "one" });
+
+          yield* writeMessage("two");
+          yield* manager.rescan;
+          expect(yield* invoke).toMatchObject({ message: "two" });
+
+          // A failed load keeps the previous code and is retried by the next rescan,
+          // even though the folder has not changed since.
+          Reflect.set(globalThis, Symbol.for(failSymbol), true);
+          yield* writeMessage("three");
+          yield* manager.rescan;
+          expect(yield* invoke).toMatchObject({ message: "two" });
+          Reflect.deleteProperty(globalThis, Symbol.for(failSymbol));
+          yield* manager.rescan;
+          expect(yield* invoke).toMatchObject({ message: "three" });
+        }),
+      );
+    }),
+  );
+
   it.effect("rescans once per debounced burst of folder events", () =>
     Effect.gen(function* () {
       const events = yield* Queue.unbounded<string>();

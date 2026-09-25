@@ -1,3 +1,4 @@
+import * as NodeCrypto from "node:crypto";
 import * as NodeURL from "node:url";
 
 import {
@@ -46,6 +47,7 @@ interface DiscoveryResult {
 interface LoadedDefinition {
   readonly cacheDirectory: string;
   readonly definition: PluginDefinition;
+  readonly fingerprint: string;
   readonly retired: Promise<void>;
 }
 
@@ -218,31 +220,15 @@ export const make = Effect.fn("PluginPackageManager.make")(function* () {
   const activeManifests = new Map<string, PluginManifestType>();
   const activeRetirements = new Map<string, Promise<void>>();
   const packageErrors = new Map<string, string>();
-  // The folder fingerprint each enabled package was last loaded from, success
-  // or not, so a rescan reloads only what actually changed.
+  // The folder fingerprint each active package was loaded from, so a rescan
+  // reloads only what changed and retries packages that failed to load.
   const loadedFingerprints = new Map<string, string>();
   let loadSequence = 0;
 
-  // Installs and removals rename whole folders, so the folder and manifest
-  // identities change whenever a package is replaced.
+  // Every file's path, size and mtime, so in-place code edits are picked up on
+  // the next rescan as well as whole-folder installs.
   const fingerprint = (discovered: DiscoveredPackage) =>
-    Effect.all([
-      fileSystem.stat(discovered.directory),
-      fileSystem.stat(path.join(discovered.directory, MANIFEST_FILE_NAME)),
-    ]).pipe(
-      Effect.map((infos) =>
-        infos
-          .map((info) =>
-            [
-              Option.getOrUndefined(info.ino),
-              Option.getOrUndefined(info.mtime)?.getTime(),
-              info.size,
-            ].join(":"),
-          )
-          .join("/"),
-      ),
-      Effect.orElseSucceed(() => "unknown"),
-    );
+    validatePackageTree(discovered, "rescan").pipe(Effect.orElseSucceed(() => "unknown"));
 
   const removeCacheDirectory = (directory: string) =>
     fileSystem
@@ -264,6 +250,7 @@ export const make = Effect.fn("PluginPackageManager.make")(function* () {
     const pending: Array<readonly [lexical: string, expectedCanonical: string]> = [
       [discovered.directory, path.resolve(canonicalPluginsDirectory, relativeRoot)],
     ];
+    const stamps: Array<string> = [];
     while (pending.length > 0) {
       const current = pending.pop();
       if (current === undefined) continue;
@@ -281,6 +268,14 @@ export const make = Effect.fn("PluginPackageManager.make")(function* () {
       const info = yield* fileSystem
         .stat(lexical)
         .pipe(Effect.mapError((error) => operationError(operation, error, discovered.manifest.id)));
+      stamps.push(
+        [
+          path.relative(discovered.directory, lexical),
+          info.type,
+          info.size,
+          Option.getOrUndefined(info.mtime)?.getTime(),
+        ].join(":"),
+      );
       if (info.type !== "Directory") continue;
       const entries = yield* fileSystem
         .readDirectory(lexical)
@@ -289,6 +284,7 @@ export const make = Effect.fn("PluginPackageManager.make")(function* () {
         pending.push([path.join(lexical, entry), path.join(expectedCanonical, entry)]);
       }
     }
+    return NodeCrypto.createHash("sha256").update(stamps.sort().join("\n")).digest("hex");
   });
 
   const discover = Effect.fn("PluginPackageManager.discover")(function* (
@@ -340,7 +336,6 @@ export const make = Effect.fn("PluginPackageManager.make")(function* () {
     discovered: DiscoveredPackage,
     operation: PluginPackageOperation,
   ) {
-    loadedFingerprints.set(discovered.manifest.id, yield* fingerprint(discovered));
     const serverEntrypoint = discovered.manifest.entrypoints.server;
     if (serverEntrypoint === undefined) {
       return yield* operationError(
@@ -349,7 +344,7 @@ export const make = Effect.fn("PluginPackageManager.make")(function* () {
         discovered.manifest.id,
       );
     }
-    yield* validatePackageTree(discovered, operation);
+    const packageFingerprint = yield* validatePackageTree(discovered, operation);
     const sourceEntrypointPath = path.resolve(discovered.directory, serverEntrypoint);
     const relativeEntrypoint = path.relative(discovered.directory, sourceEntrypointPath);
     if (
@@ -414,6 +409,7 @@ export const make = Effect.fn("PluginPackageManager.make")(function* () {
       definition: makeDefinition(discovered, loaded.value, markRetired, (error) => {
         packageErrors.set(discovered.manifest.id, detailFromUnknown(error));
       }),
+      fingerprint: packageFingerprint,
       retired,
     } satisfies LoadedDefinition;
   });
@@ -554,6 +550,7 @@ export const make = Effect.fn("PluginPackageManager.make")(function* () {
           }
 
           activeDefinitions.set(id, loaded.definition);
+          loadedFingerprints.set(id, loaded.fingerprint);
           activeCacheDirectories.set(id, loaded.cacheDirectory);
           activeManifests.set(id, pluginPackage.manifest);
           activeRetirements.set(id, loaded.retired);
@@ -712,6 +709,7 @@ export const make = Effect.fn("PluginPackageManager.make")(function* () {
           return yield* Effect.failCause(reconciled.cause);
         }
         activeDefinitions.set(id, loaded.definition);
+        loadedFingerprints.set(id, loaded.fingerprint);
         activeCacheDirectories.set(id, loaded.cacheDirectory);
         activeManifests.set(id, pluginPackage.manifest);
         activeRetirements.set(id, loaded.retired);
