@@ -1,4 +1,8 @@
-import type { PluginPackageStatus, PluginPackageStatusSnapshot } from "@t3tools/contracts";
+import type {
+  EnvironmentId,
+  PluginPackageStatus,
+  PluginPackageStatusSnapshot,
+} from "@t3tools/contracts";
 import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
@@ -12,6 +16,7 @@ import {
   SearchIcon,
   ShieldAlertIcon,
 } from "lucide-react";
+import { Link } from "@tanstack/react-router";
 import { useCallback, useMemo, useState } from "react";
 
 import type { EnvironmentPresentation } from "../../state/environments";
@@ -48,12 +53,14 @@ function actionFailureMessage(action: PackageAction, error: unknown): string {
 }
 
 function PluginPackageRow({
+  environmentId,
   pluginPackage,
   pendingAction,
   readOnly,
   onEnabledChange,
   onReload,
 }: {
+  readonly environmentId: EnvironmentId;
   readonly pluginPackage: PluginPackageStatus;
   readonly pendingAction: PackageAction | null;
   readonly readOnly: boolean;
@@ -97,6 +104,22 @@ function PluginPackageRow({
       className="border border-border/60 bg-card/35"
       control={
         <div className="flex items-center gap-2">
+          <Button
+            render={
+              <Link
+                to="/settings/storage"
+                // Plugin data is per environment, and Storage hides it in project scopes.
+                search={{ machine: environmentId }}
+                hash="storage-plugin-data"
+                hashScrollIntoView={false}
+                state={{ settingsTargetHighlight: true }}
+              />
+            }
+            size="xs"
+            variant="ghost-muted"
+          >
+            Manage data
+          </Button>
           {pluginPackage.enabled ? (
             <Button
               type="button"
@@ -382,6 +405,7 @@ function EnvironmentPluginsSettings({
           {visiblePackages.map((pluginPackage) => (
             <PluginPackageRow
               key={pluginPackage.id}
+              environmentId={environmentId}
               pluginPackage={pluginPackage}
               readOnly={readOnly || pending !== null}
               pendingAction={

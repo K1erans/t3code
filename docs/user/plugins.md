@@ -23,6 +23,14 @@ A running server picks up changes without a restart. New plugins appear disabled
 you remove it, it shows as not installed until you install it again. A removed disabled plugin
 simply leaves the list. If a change does not show up, use **Rescan** in Settings → Plugins.
 
+## Plugin data
+
+Data a plugin saves survives disabling, reloading and reinstalling. When you remove a plugin, its
+data is kept for 30 days in case you install it again, then deleted automatically.
+**Settings → Storage → Plugin data** lists every plugin's data on the environment, shows when
+leftovers will be deleted, and lets you delete them sooner. Sizes are measured only when you press
+**Calculate sizes**.
+
 ## Active and idle
 
 An enabled plugin starts when you run one of its commands and stops again after ten minutes

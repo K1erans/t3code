@@ -2,6 +2,9 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { PluginCommandInvocationError } from "@t3tools/contracts";
 import { it } from "@effect/vitest";
 import { expect } from "vite-plus/test";
+import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
+import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -41,14 +44,21 @@ const manifest = {
 
 const encodeManifest = Schema.encodeSync(Schema.fromJsonString(PluginManifest));
 const encodeJsonString = Schema.encodeSync(Schema.fromJsonString(Schema.String));
-const decodePluginState = Schema.decodeUnknownSync(
-  Schema.fromJsonString(Schema.Struct({ enabled: Schema.Array(Schema.String) })),
+const PluginStateJson = Schema.fromJsonString(
+  Schema.Struct({
+    enabled: Schema.Array(Schema.String),
+    missingSince: Schema.optional(Schema.Record(Schema.String, Schema.Number)),
+  }),
 );
-const readEnabledIds = (baseDir: string) =>
+const decodePluginState = Schema.decodeUnknownSync(PluginStateJson);
+const encodePluginState = Schema.encodeSync(PluginStateJson);
+const readPluginState = (baseDir: string) =>
   FileSystem.FileSystem.pipe(
     Effect.flatMap((fileSystem) => fileSystem.readFileString(`${baseDir}/userdata/plugins.json`)),
-    Effect.map((contents) => decodePluginState(contents).enabled),
+    Effect.map(decodePluginState),
   );
+const readEnabledIds = (baseDir: string) =>
+  readPluginState(baseDir).pipe(Effect.map((state) => state.enabled));
 /** Runs `effect` while the state directory rejects writes, so persisting enabled state fails. */
 const withReadOnlyStateDir = <A, E, R>(
   fileSystem: FileSystem.FileSystem,
@@ -122,7 +132,9 @@ const useEnvironment = <A, E>(
   effect: Effect.Effect<
     A,
     E,
-    PluginPackageManager.PluginPackageManager | PluginCommandCatalog.PluginCommandCatalog
+    | PluginPackageManager.PluginPackageManager
+    | PluginCommandCatalog.PluginCommandCatalog
+    | FileSystem.FileSystem
   >,
   options?: EnvironmentLayerOptions,
 ) => Effect.scoped(effect.pipe(Effect.provide(makeEnvironmentLayer(baseDir, options))));
@@ -622,6 +634,263 @@ export default function activate() {}
       expect(yield* useEnvironment(baseDir, afterStartup)).toBe("Invoked 5 times.");
       expect(yield* fileSystem.exists(`${dataDirectory}/storage.sqlite`)).toBe(true);
       expect(yield* fileSystem.exists(`${baseDir}/userdata/state.sqlite`)).toBe(false);
+    }),
+  );
+
+  it.effect("starts a data countdown when a plugin is removed and clears it on reinstall", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3code-plugin-data-countdown-test-",
+      });
+      const packageDirectory = `${baseDir}/userdata/plugins/${packageId}`;
+      const install = Effect.gen(function* () {
+        yield* fileSystem.makeDirectory(packageDirectory, { recursive: true });
+        yield* fileSystem.writeFileString(
+          `${packageDirectory}/t3-plugin.json`,
+          encodeManifest(manifest),
+        );
+        yield* fileSystem.writeFileString(
+          `${packageDirectory}/index.mjs`,
+          pluginSource(`${baseDir}/disposed.log`),
+        );
+      });
+      yield* install;
+      yield* TestClock.setTime(Duration.toMillis(Duration.days(100)));
+
+      yield* useEnvironment(
+        baseDir,
+        Effect.gen(function* () {
+          const manager = yield* PluginPackageManager.PluginPackageManager;
+          const catalog = yield* PluginCommandCatalog.PluginCommandCatalog;
+          const count = catalog.list.pipe(
+            Effect.flatMap((listed) =>
+              manager.invokeCommand({ generation: listed.generation, id: countCommandId }),
+            ),
+            Effect.map((result) => result.message),
+          );
+          yield* manager.enable(packageId);
+          expect(yield* count).toBe("Invoked 1 times.");
+          expect(yield* manager.data).toEqual({
+            entries: [{ id: packageId, name: "Fixture", installed: true }],
+          });
+
+          const removedAt = yield* Clock.currentTimeMillis;
+          yield* fileSystem.remove(packageDirectory, { recursive: true });
+          yield* manager.rescan;
+          expect((yield* readPluginState(baseDir)).missingSince).toEqual({
+            [packageId]: removedAt,
+          });
+          expect(yield* manager.data).toEqual({
+            entries: [
+              {
+                id: packageId,
+                installed: false,
+                deletesAt: DateTime.formatIso(
+                  DateTime.makeUnsafe(
+                    removedAt + Duration.toMillis(PluginPackageManager.PLUGIN_DATA_RETENTION),
+                  ),
+                ),
+              },
+            ],
+          });
+
+          // A later rescan keeps the original start rather than restarting the countdown.
+          yield* TestClock.setTime(removedAt + Duration.toMillis(Duration.days(1)));
+          yield* manager.rescan;
+          expect((yield* readPluginState(baseDir)).missingSince).toEqual({
+            [packageId]: removedAt,
+          });
+
+          yield* install;
+          yield* manager.rescan;
+          expect((yield* readPluginState(baseDir)).missingSince).toBeUndefined();
+          expect((yield* manager.data).entries).toEqual([
+            { id: packageId, name: "Fixture", installed: true },
+          ]);
+          expect(yield* count).toBe("Invoked 2 times.");
+        }),
+      );
+    }),
+  );
+
+  it.effect("deletes leftover data once its countdown has run out", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3code-plugin-data-expiry-test-",
+      });
+      const now = Duration.toMillis(Duration.days(100));
+      const retention = Duration.toMillis(PluginPackageManager.PLUGIN_DATA_RETENTION);
+      yield* TestClock.setTime(now);
+      for (const id of [
+        "com.acme.expired",
+        "com.acme.recent",
+        "com.acme.broken",
+        "com.acme.bare",
+      ]) {
+        yield* fileSystem.makeDirectory(`${baseDir}/userdata/plugin-data/${id}`, {
+          recursive: true,
+        });
+      }
+      // A plugin whose manifest is unreadable or missing is still installed, so its data stays.
+      yield* fileSystem.makeDirectory(`${baseDir}/userdata/plugins/com.acme.bare`, {
+        recursive: true,
+      });
+      yield* fileSystem.makeDirectory(`${baseDir}/userdata/plugins/com.acme.broken`, {
+        recursive: true,
+      });
+      yield* fileSystem.writeFileString(
+        `${baseDir}/userdata/plugins/com.acme.broken/t3-plugin.json`,
+        "{ not json",
+      );
+      yield* fileSystem.writeFileString(
+        `${baseDir}/userdata/plugins.json`,
+        encodePluginState({
+          enabled: [],
+          missingSince: {
+            "com.acme.expired": now - retention,
+            "com.acme.recent": now - retention + 1,
+            "com.acme.gone": now - 1,
+            "com.acme.broken": now - retention,
+            "com.acme.bare": now - retention,
+          },
+        }),
+      );
+
+      yield* useEnvironment(
+        baseDir,
+        PluginPackageManager.PluginPackageManager.pipe(Effect.flatMap((manager) => manager.rescan)),
+      );
+
+      expect(yield* fileSystem.exists(`${baseDir}/userdata/plugin-data/com.acme.expired`)).toBe(
+        false,
+      );
+      expect(yield* fileSystem.exists(`${baseDir}/userdata/plugin-data/com.acme.recent`)).toBe(
+        true,
+      );
+      for (const id of ["com.acme.broken", "com.acme.bare"]) {
+        expect(yield* fileSystem.exists(`${baseDir}/userdata/plugin-data/${id}`)).toBe(true);
+      }
+      // Entries whose folder is gone or whose plugin is back are dropped along with the expired one.
+      expect((yield* readPluginState(baseDir)).missingSince).toEqual({
+        "com.acme.recent": now - retention + 1,
+      });
+    }),
+  );
+
+  it.effect("measures plugin data on request and deletes only leftovers", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3code-plugin-data-delete-test-",
+      });
+      yield* writePackage(baseDir, packageId, commandId, "export default () => {};\n");
+      const leftover = `${baseDir}/userdata/plugin-data/com.acme.leftover`;
+      yield* fileSystem.makeDirectory(`${leftover}/nested`, { recursive: true });
+      yield* fileSystem.writeFileString(`${leftover}/nested/notes.txt`, "hello");
+      yield* fileSystem.makeDirectory(`${baseDir}/userdata/plugin-data/${packageId}`);
+
+      yield* useEnvironment(
+        baseDir,
+        Effect.gen(function* () {
+          const manager = yield* PluginPackageManager.PluginPackageManager;
+          yield* manager.rescan;
+          expect((yield* manager.data).entries.map((entry) => entry.sizeBytes)).toEqual([
+            undefined,
+            undefined,
+          ]);
+          expect(yield* manager.dataSizes).toMatchObject({
+            entries: [
+              { id: "com.acme.leftover", installed: false, sizeBytes: 5 },
+              { id: packageId, installed: true, sizeBytes: 0 },
+            ],
+          });
+
+          const installed = yield* Effect.exit(manager.deleteData(packageId));
+          expect(installed._tag).toBe("Failure");
+          expect(yield* fileSystem.exists(`${baseDir}/userdata/plugin-data/${packageId}`)).toBe(
+            true,
+          );
+
+          expect((yield* manager.deleteData("com.acme.leftover")).entries).toMatchObject([
+            { id: packageId },
+          ]);
+          expect(yield* fileSystem.exists(leftover)).toBe(false);
+          expect((yield* readPluginState(baseDir)).missingSince).toBeUndefined();
+          const again = yield* Effect.exit(manager.deleteData("com.acme.leftover"));
+          expect(again._tag === "Failure" && Cause.squash(again.cause)).toMatchObject({
+            _tag: "PluginPackageNotFoundError",
+          });
+        }),
+      );
+    }),
+  );
+
+  it.effect("deletes a removed plugin's data only after its running command finishes", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3code-plugin-data-running-test-",
+      });
+      const gateSymbol = `t3.test.plugin.data-running.${baseDir}`;
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let markStarted!: () => void;
+      const commandStarted = new Promise<void>((resolve) => {
+        markStarted = resolve;
+      });
+      yield* Effect.acquireRelease(
+        Effect.sync(() =>
+          Reflect.set(globalThis, Symbol.for(gateSymbol), { started: markStarted, released }),
+        ),
+        () => Effect.sync(() => Reflect.deleteProperty(globalThis, Symbol.for(gateSymbol))),
+      );
+      const packageDirectory = yield* writePackage(
+        baseDir,
+        packageId,
+        commandId,
+        `export default function activate(api) {
+  api.registerCommand("${commandId}", async () => {
+    const gate = globalThis[Symbol.for(${encodeJsonString(gateSymbol)})];
+    gate.started();
+    await gate.released;
+    await api.storage.set("last", "written after removal");
+    return { message: "stored", tone: "success" };
+  });
+}
+`,
+      );
+
+      yield* useEnvironment(
+        baseDir,
+        Effect.gen(function* () {
+          const manager = yield* PluginPackageManager.PluginPackageManager;
+          const catalog = yield* PluginCommandCatalog.PluginCommandCatalog;
+          yield* manager.enable(packageId);
+          const listed = yield* catalog.list;
+          const invoked = yield* Effect.forkChild(
+            manager.invokeCommand({ generation: listed.generation, id: commandId }),
+          );
+          yield* Effect.promise(() => commandStarted);
+
+          // The rescan retiring the removed plugin holds the lock until the command
+          // finishes, so the delete queued behind it never closes a store in use.
+          yield* fileSystem.remove(packageDirectory, { recursive: true });
+          const rescanned = yield* Effect.forkChild(manager.rescan);
+          const deleted = yield* Effect.forkChild(manager.deleteData(packageId));
+          release();
+
+          expect(yield* Fiber.join(invoked)).toEqual({ message: "stored", tone: "success" });
+          yield* Fiber.join(rescanned);
+          expect((yield* Fiber.join(deleted)).entries).toEqual([]);
+          expect(yield* fileSystem.exists(`${baseDir}/userdata/plugin-data/${packageId}`)).toBe(
+            false,
+          );
+        }),
+      );
     }),
   );
 

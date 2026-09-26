@@ -1,6 +1,6 @@
 import * as Schema from "effect/Schema";
 
-import { TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { IsoDateTime, NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
 
 export const PluginPackageId = Schema.String.check(
   Schema.isPattern(/^[a-z0-9][a-z0-9-]*(?:\.[a-z0-9][a-z0-9-]*)+$/),
@@ -63,6 +63,27 @@ export const PluginPackageStatusSnapshot = Schema.Struct({
 export type PluginPackageStatusSnapshot = typeof PluginPackageStatusSnapshot.Type;
 
 /**
+ * One plugin's folder in `plugin-data/`. Data of a plugin that is no longer
+ * installed is a leftover, deleted automatically at `deletesAt`.
+ */
+export const PluginDataEntry = Schema.Struct({
+  id: PluginPackageId,
+  /** The manifest name, known while the plugin is installed. */
+  name: Schema.optional(TrimmedNonEmptyString),
+  installed: Schema.Boolean,
+  /** Absent until a discovery has noticed the plugin missing. */
+  deletesAt: Schema.optional(IsoDateTime),
+  /** Present only when sizes were asked for, since measuring walks every file. */
+  sizeBytes: Schema.optional(NonNegativeInt),
+});
+export type PluginDataEntry = typeof PluginDataEntry.Type;
+
+export const PluginDataSnapshot = Schema.Struct({
+  entries: Schema.Array(PluginDataEntry),
+});
+export type PluginDataSnapshot = typeof PluginDataSnapshot.Type;
+
+/**
  * Rejects keys other than `id`. Annotations cannot override the decoder's
  * `onExcessProperty`, so the check runs on the raw input instead.
  */
@@ -85,6 +106,8 @@ export const PluginPackageOperation = Schema.Literals([
   "rescan",
   "activate",
   "deactivate",
+  "data",
+  "deleteData",
 ]);
 export type PluginPackageOperation = typeof PluginPackageOperation.Type;
 

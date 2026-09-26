@@ -11,6 +11,7 @@ import {
   NumberFieldIncrement,
   NumberFieldInput,
 } from "../ui/number-field";
+import { PluginDataSection } from "./PluginDataSettings";
 import { SettingsPageContainer, SettingsRow, SettingsSection } from "./settingsLayout";
 import { SettingsScopeNotice } from "./SettingsScopeNotice";
 import type { ScopedSettingsTarget } from "./scopedSettings";
@@ -83,7 +84,7 @@ function RetentionControl({
 }
 
 export function StorageSettingsPanel() {
-  const { scope, connectedEnvironments, targets, target } = useSettingsScope();
+  const { scope, connectedEnvironments, targets, target, environment } = useSettingsScope();
   const scopedSettings = useScopedSettings();
   const isProjectScope = scope.kind === "project" || scope.kind === "checkout";
   const settings = {
@@ -283,6 +284,15 @@ export function StorageSettingsPanel() {
           />
         </SettingsSection>
       )}
+
+      {!isProjectScope && environment !== null ? (
+        <PluginDataSection
+          key={environment.environmentId}
+          environment={environment}
+          // Plugin data belongs to one environment; name it when several are selected.
+          showEnvironmentHint={scope.kind !== "environment" && connectedEnvironments.length > 1}
+        />
+      ) : null}
     </SettingsPageContainer>
   );
 }

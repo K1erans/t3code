@@ -56,3 +56,19 @@ export function pluginActionErrorText(error: unknown): string | null {
   if (error instanceof Error && error.message.trim().length > 0) return error.message;
   return null;
 }
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/** The countdown shown on leftover plugin data, rounded up to whole days. */
+export function pluginDataDeletionLabel(deletesAt: string, now: number): string {
+  const days = Math.ceil((Date.parse(deletesAt) - now) / DAY_MS);
+  if (days <= 0) return "Deletes on the next rescan";
+  return `Deletes in ${days} ${days === 1 ? "day" : "days"}`;
+}
+
+export function formatPluginDataSize(bytes: number): string {
+  if (bytes >= 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${bytes} bytes`;
+}

@@ -2398,6 +2398,20 @@ const makeWsRpcLayer = (
             ),
             { "rpc.aggregate": "pluginScreens" },
           ),
+        [WS_METHODS.pluginPackagesData]: (_input) =>
+          observeRpcEffect(WS_METHODS.pluginPackagesData, pluginPackages.data, {
+            "rpc.aggregate": "pluginPackages",
+          }),
+        [WS_METHODS.pluginPackagesDataSizes]: (_input) =>
+          observeRpcEffect(WS_METHODS.pluginPackagesDataSizes, pluginPackages.dataSizes, {
+            "rpc.aggregate": "pluginPackages",
+          }),
+        [WS_METHODS.pluginPackagesDeleteData]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.pluginPackagesDeleteData,
+            pluginPackages.deleteData(input.id),
+            { "rpc.aggregate": "pluginPackages" },
+          ),
         [WS_METHODS.serverRefreshProviders]: (input) =>
           observeRpcEffect(
             WS_METHODS.serverRefreshProviders,

@@ -27,8 +27,9 @@ change means a new major, and the old one stays working until the version record
 
 ## Commands run outside every lock
 
-The runtime serializes reconcile and dispose, and the manager serializes enable, disable, reload
-and rescan. Command invocations and `pluginPackages.status` take neither lock. A command can run for
+The runtime serializes reconcile and dispose, and the manager serializes enable, disable, reload,
+rescan and deleting plugin data. Command invocations and the status and data listings take neither
+lock. A command can run for
 up to the entry point timeout, and holding a lock that long would stall every other command, every
 lifecycle action and every client's Settings, including remote and mobile ones.
 
@@ -71,6 +72,15 @@ disable or reload revokes URLs already handed out. In Vite dev and `npx t3` the 
 app's own origin, which is why screens must never get `allow-same-origin`: the CSP `sandbox` header
 and the iframe attribute both give them an opaque origin. Screens are static files and never
 activate their plugin.
+
+## Plugin data outlives its plugin
+
+`plugin-data/<id>/` is never touched by disable, reload or reinstall. Only two things remove it:
+Delete data in Settings → Storage, and the rescan sweep once the id has been missing for 30 days
+(`missingSince` in `plugins.json`). "Missing" means no discovered package, no loaded version and no
+folder in `plugins/` named after the id, so a missing or broken manifest never starts the countdown.
+Deleting takes the manager lock, and a rescan retiring a removed plugin holds it until the plugin's
+running commands finish, so a store is never closed under a command.
 
 ## Mobile in v0
 
