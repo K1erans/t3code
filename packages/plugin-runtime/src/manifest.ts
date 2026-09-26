@@ -40,10 +40,22 @@ const ClosedStruct = <Fields extends Schema.Struct.Fields>(fields: Fields) => {
  * lists it from the manifest, so it appears before its plugin has activated.
  */
 const CommandContribution = ClosedStruct({
-  id: NamespacedId,
-  title: Schema.String.check(Schema.isNonEmpty(), Schema.isMaxLength(120)),
+  // The palette catalog caps command ids at 200 characters.
+  id: NamespacedId.check(Schema.isMaxLength(200)),
+  title: Schema.String.check(Schema.isPattern(/\S/), Schema.isMaxLength(120)),
   description: Schema.optional(Schema.String.check(Schema.isMaxLength(500))),
 });
+
+const CommandContributions = Schema.Array(CommandContribution).check(
+  Schema.makeFilter((commands) => {
+    const ids = new Set<string>();
+    for (const command of commands) {
+      if (ids.has(command.id)) return `Duplicate command id ${command.id}`;
+      ids.add(command.id);
+    }
+    return undefined;
+  }),
+);
 
 export const PluginManifest = ClosedStruct({
   manifestVersion: Schema.Literal(1),
@@ -62,9 +74,7 @@ export const PluginManifest = ClosedStruct({
    */
   activationEvents: Schema.optional(Schema.Array(Schema.Literal("onStartup"))),
   entrypoints: Schema.optional(ClosedStruct({ server: Schema.optional(RelativeEntrypoint) })),
-  contributes: Schema.optional(
-    ClosedStruct({ commands: Schema.optional(Schema.Array(CommandContribution)) }),
-  ),
+  contributes: Schema.optional(ClosedStruct({ commands: Schema.optional(CommandContributions) })),
 });
 
 export type PluginManifest = typeof PluginManifest.Type;

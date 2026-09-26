@@ -161,7 +161,7 @@ const declaredCommands = (manifest: PluginManifest): ReadonlyArray<PluginCommand
     const description = command.description?.trim();
     return {
       id: command.id,
-      label: command.title.trim() || command.id,
+      label: command.title.trim(),
       ...(description ? { description } : {}),
       surfaces: [...new Set(surfaces)],
     };

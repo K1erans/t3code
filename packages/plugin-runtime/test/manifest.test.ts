@@ -83,6 +83,20 @@ describe("PluginManifest", () => {
     ).toThrow();
   });
 
+  it("rejects commands the palette cannot list", () => {
+    const withCommands = (commands: ReadonlyArray<unknown>) =>
+      decodeManifest({ ...validManifest, contributes: { commands } });
+    expect(() => withCommands([{ id: `linear.${"a".repeat(194)}`, title: "Long" }])).toThrow();
+    expect(withCommands([{ id: `linear.${"a".repeat(193)}`, title: "Long" }])).toBeDefined();
+    expect(() => withCommands([{ id: "linear.blank", title: "   " }])).toThrow();
+    expect(() =>
+      withCommands([
+        { id: "linear.twice", title: "One" },
+        { id: "linear.twice", title: "Two" },
+      ]),
+    ).toThrow();
+  });
+
   it("rejects malformed versions and capability ids", () => {
     expect(() => decodeManifest({ ...validManifest, version: "next" })).toThrow();
     expect(() => decodeManifest({ ...validManifest, version: "01.2.3" })).toThrow();
