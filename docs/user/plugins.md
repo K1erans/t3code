@@ -25,7 +25,8 @@ simply leaves the list. If a change does not show up, use **Rescan** in Settings
 
 ## Active and idle
 
-An enabled plugin starts when you run one of its commands, or when an agent turn starts or ends
-if the plugin follows threads, and stops again after ten minutes without use. Plugins do not run in
-the background while nothing needs them. **Settings → Plugins**
+An enabled plugin starts when you run one of its commands, or, for plugins that ask to, when an
+agent turn starts or ends. It stops again after ten minutes without use, so plugins do not run in
+the background while nothing needs them. A plugin that asks to start with the server keeps running
+instead. **Settings → Plugins**
 shows each one as **Active** or **Idle**; an idle plugin's commands stay in the command palette.

@@ -7,6 +7,7 @@ import {
   ModelSelection,
   type OrchestrationEvent,
   type OrchestrationProjectShell,
+  type OrchestrationSessionStatus,
   type OrchestrationThreadShell,
   ProjectId,
   ProviderInteractionMode,
@@ -111,13 +112,53 @@ export const resolveThreadOptions = (
   });
 };
 
-/** A thread's turn state: running while its session works, else how its latest turn ended. */
+/** A thread's turn state as its projection holds it. */
 export const turnStateOf = (
-  thread: Pick<OrchestrationThreadShell, "latestTurn" | "session">,
-): PluginTurnState => {
-  const status = thread.session?.status;
-  if (status === "starting" || status === "running") return "running";
-  return thread.latestTurn?.state ?? "idle";
+  thread: Pick<OrchestrationThreadShell, "latestTurn">,
+): PluginTurnState => thread.latestTurn?.state ?? "idle";
+
+/** How a turn that was running ends when its session reaches `status`; null while it still runs. */
+const settledTurnState = (
+  status: OrchestrationSessionStatus,
+): Exclude<PluginTurnState, "idle" | "running"> | null => {
+  switch (status) {
+    case "idle":
+    case "ready":
+      return "completed";
+    case "error":
+      return "error";
+    case "interrupted":
+    case "stopped":
+      return "interrupted";
+    case "starting":
+    case "running":
+      return null;
+  }
+};
+
+/**
+ * The turn state after `event`, derived from the event itself the way the projector
+ * derives the latest turn, or `undefined` when only the projection can tell. Reading
+ * the projection for these events would see later ones too, so a turn that starts
+ * and ends before its first event is handled would never be reported as running.
+ */
+export const turnStateAfterEvent = (
+  previous: PluginTurnState,
+  event: OrchestrationEvent,
+): PluginTurnState | undefined => {
+  switch (event.type) {
+    case "thread.session-set": {
+      const { status, activeTurnId } = event.payload.session;
+      if (status === "running") return activeTurnId === null ? previous : "running";
+      return previous === "running" ? (settledTurnState(status) ?? previous) : previous;
+    }
+    case "thread.turn-interrupt-requested":
+      return previous === "running" && event.payload.turnId !== undefined
+        ? "interrupted"
+        : previous;
+    default:
+      return undefined;
+  }
 };
 
 /** Events after which a thread's turn state may differ. */
@@ -312,14 +353,17 @@ export const make = Effect.gen(function* () {
             lastStates.delete(threadId);
             return undefined;
           }
-          // Projections commit before events publish, so the shell already reflects `event`.
+          const previous = lastStates.get(threadId) ?? "idle";
+          const derived = turnStateAfterEvent(previous, event);
+          if (derived === previous) return undefined;
+          // Projections commit before events publish, so the shell reflects at least `event`.
           const thread = yield* snapshots.getThreadShellById(ThreadId.make(threadId)).pipe(
             Effect.map(Option.getOrUndefined),
             Effect.orElseSucceed(() => undefined),
           );
           if (thread === undefined) return undefined;
-          const state = turnStateOf(thread);
-          if ((lastStates.get(threadId) ?? "idle") === state) return undefined;
+          const state = derived ?? turnStateOf(thread);
+          if (state === previous) return undefined;
           lastStates.set(threadId, state);
           return {
             threadId,

@@ -29,6 +29,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
+import * as Schedule from "effect/Schedule";
 import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
@@ -75,6 +76,12 @@ const INVALID_PACKAGE_TREE = "invalid";
 const DEFAULT_COMMAND_SURFACES: PluginCommand["surfaces"] = ["web", "desktop"];
 /** An active plugin with no command running for this long is shut down. */
 export const IDLE_TIMEOUT = Duration.minutes(10);
+/** Backoff for a turn state watch that failed: doubling from one second, capped at a minute. */
+const TURN_STATE_WATCH_RETRY = Schedule.exponential(Duration.seconds(1)).pipe(
+  Schedule.modifyDelay(({ duration }) =>
+    Effect.succeed(Duration.min(duration, Duration.minutes(1))),
+  ),
+);
 /** How often active plugins are checked against `IDLE_TIMEOUT`. */
 export const IDLE_CHECK_INTERVAL = Duration.minutes(1);
 
@@ -828,7 +835,18 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
         ),
       );
     }),
-  ).pipe(Effect.interruptible, Effect.ignoreCause({ log: true }));
+  ).pipe(
+    // A failed subscription or first read is retried, so plugins keep hearing about
+    // turns without waiting for a package to load or unload.
+    Effect.tapCause((cause) =>
+      Effect.logWarning("Plugin turn state watch failed; retrying", {
+        error: detailFromCause(cause),
+      }),
+    ),
+    Effect.retry(TURN_STATE_WATCH_RETRY),
+    Effect.interruptible,
+    Effect.ignoreCause({ log: true }),
+  );
 
   /** Starts or stops the turn state watch to match the loaded packages. */
   const syncTurnStateWatch = Effect.suspend(() => {

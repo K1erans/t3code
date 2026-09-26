@@ -2029,6 +2029,71 @@ export default function activate(api) {
     }),
   );
 
+  it.effect("keeps following turn state changes after the watch fails to start", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3code-plugin-package-turn-watch-retry-test-",
+      });
+      const changes = yield* Queue.unbounded<PluginThreads.PluginTurnStateChange>();
+      const hookSymbol = `t3.test.plugin.turn-watch-retry.${baseDir}`;
+      let markReceived!: (change: unknown) => void;
+      const received = new Promise<unknown>((resolve) => {
+        markReceived = resolve;
+      });
+      yield* Effect.acquireRelease(
+        Effect.sync(() => Reflect.set(globalThis, Symbol.for(hookSymbol), markReceived)),
+        () => Effect.sync(() => Reflect.deleteProperty(globalThis, Symbol.for(hookSymbol))),
+      );
+      const directory = yield* writePackage(
+        baseDir,
+        packageId,
+        commandId,
+        `export default function activate(api) {
+  api.threads.onTurnStateChange(globalThis[Symbol.for(${encodeJsonString(hookSymbol)})]);
+}
+`,
+      );
+      yield* fileSystem.writeFileString(
+        `${directory}/t3-plugin.json`,
+        threadsManifest(packageId, { activationEvents: ["onTurnStateChange"] }),
+      );
+      yield* fileSystem.writeFileString(
+        `${baseDir}/userdata/plugins.json`,
+        `{"enabled":["${packageId}"]}\n`,
+      );
+      let subscriptions = 0;
+      const threads = PluginThreads.PluginThreads.of({
+        ...noThreads,
+        // The first subscription fails, as a failed read of the current states would.
+        turnStateChanges: Effect.suspend(() =>
+          ++subscriptions === 1
+            ? Effect.fail(new PluginThreads.PluginThreadsError({ reason: "database busy" }))
+            : Effect.succeed(Stream.fromQueue(changes)),
+        ),
+      });
+
+      yield* useEnvironment(
+        baseDir,
+        Effect.gen(function* () {
+          const manager = yield* PluginPackageManager.PluginPackageManager;
+          yield* manager.rescan;
+          expect(subscriptions).toBe(1);
+          yield* TestClock.adjust(Duration.seconds(1));
+          const change = {
+            threadId: "thread-1",
+            projectId: "project-1",
+            state: "running",
+          } as const;
+          yield* Queue.offer(changes, change);
+          expect(yield* Effect.promise(() => received)).toEqual(change);
+          expect(subscriptions).toBe(2);
+        }),
+        { threads },
+      );
+    }),
+  );
+
   it.effect("hands each plugin its turn state changes one at a time, in order", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;

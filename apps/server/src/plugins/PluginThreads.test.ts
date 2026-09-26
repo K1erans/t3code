@@ -44,8 +44,8 @@ interface Fixture {
   readonly events?: ReadonlyArray<OrchestrationEvent>;
   /** Threads in the shell snapshot taken when the plugin subscribes. */
   readonly threads?: ReadonlyArray<OrchestrationThreadShell>;
-  /** Each thread's shell after each of its events, read in order. */
-  readonly threadsAfterEvents?: Record<string, Array<OrchestrationThreadShell>>;
+  /** Thread shells as the projection holds them while the events are handled. */
+  readonly projectedThreads?: Record<string, OrchestrationThreadShell>;
 }
 
 /** `PluginThreads` over stub services, recording every command it dispatches. */
@@ -54,7 +54,7 @@ const makeThreads = ({
   isRepo = true,
   events = [],
   threads = [],
-  threadsAfterEvents = {},
+  projectedThreads = {},
 }: Fixture = {}) => {
   const dispatched: Array<OrchestrationCommand> = [];
   const layer = Layer.effect(PluginThreads.PluginThreads, PluginThreads.make).pipe(
@@ -72,8 +72,7 @@ const makeThreads = ({
         getProjectShells: () => Effect.succeed([project]),
         getProjectShellById: (id) =>
           Effect.succeed(id === projectId ? Option.some(project) : Option.none()),
-        getThreadShellById: (id) =>
-          Effect.sync(() => Option.fromNullishOr(threadsAfterEvents[id]?.shift())),
+        getThreadShellById: (id) => Effect.succeed(Option.fromNullishOr(projectedThreads[id])),
         getShellSnapshot: () =>
           Effect.succeed({
             snapshotSequence: 0,
@@ -249,30 +248,10 @@ it.layer(NodeServices.layer)("plugin threads", (it) => {
   );
 });
 
-const threadShell = (
-  session: OrchestrationThreadShell["session"],
-  latestTurn: OrchestrationThreadShell["latestTurn"],
-) => ({ session, latestTurn });
 const session = (status: NonNullable<OrchestrationThreadShell["session"]>["status"]) =>
   ({ status }) as NonNullable<OrchestrationThreadShell["session"]>;
 const turn = (state: NonNullable<OrchestrationThreadShell["latestTurn"]>["state"]) =>
   ({ state }) as NonNullable<OrchestrationThreadShell["latestTurn"]>;
-
-it("derives a thread's turn state from its session and latest turn", () => {
-  expect(PluginThreads.turnStateOf(threadShell(null, null))).toBe("idle");
-  expect(PluginThreads.turnStateOf(threadShell(session("starting"), null))).toBe("running");
-  expect(PluginThreads.turnStateOf(threadShell(session("running"), turn("running")))).toBe(
-    "running",
-  );
-  expect(PluginThreads.turnStateOf(threadShell(session("ready"), turn("completed")))).toBe(
-    "completed",
-  );
-  expect(PluginThreads.turnStateOf(threadShell(session("ready"), turn("interrupted")))).toBe(
-    "interrupted",
-  );
-  expect(PluginThreads.turnStateOf(threadShell(session("error"), turn("error")))).toBe("error");
-});
-
 const shell = (
   id: string,
   status: NonNullable<OrchestrationThreadShell["session"]>["status"] | null,
@@ -284,38 +263,58 @@ const shell = (
     session: status === null ? null : session(status),
     latestTurn: turnState === null ? null : turn(turnState),
   }) as OrchestrationThreadShell;
-const threadEvent = (type: OrchestrationEvent["type"], threadId: string) =>
-  ({ type, aggregateKind: "thread", aggregateId: threadId }) as OrchestrationEvent;
+const threadEvent = (type: OrchestrationEvent["type"], threadId: string, payload?: object) =>
+  ({ type, aggregateKind: "thread", aggregateId: threadId, payload }) as OrchestrationEvent;
+const sessionSet = (
+  threadId: string,
+  status: NonNullable<OrchestrationThreadShell["session"]>["status"],
+  activeTurnId: string | null = status === "running" ? "turn-1" : null,
+) => threadEvent("thread.session-set", threadId, { threadId, session: { status, activeTurnId } });
+
+it("reads a thread's turn state from its latest turn", () => {
+  expect(PluginThreads.turnStateOf({ latestTurn: null })).toBe("idle");
+  expect(PluginThreads.turnStateOf({ latestTurn: turn("running") })).toBe("running");
+  expect(PluginThreads.turnStateOf({ latestTurn: turn("interrupted") })).toBe("interrupted");
+});
 
 it.layer(NodeServices.layer)("plugin turn state changes", (it) => {
-  it.effect("reports only real transitions, starting from the current states", () =>
+  it.effect("reports every transition, even of a turn that ended before it was handled", () =>
     Effect.gen(function* () {
       const fixture = makeThreads({
-        // "done" already finished a turn before the plugin subscribed.
+        // "done" finished a turn before the plugin subscribed.
         threads: [shell("done", "ready", "completed")],
         events: [
           // A session update that leaves the finished turn as it was.
-          threadEvent("thread.session-set", "done"),
-          // A thread created after the snapshot starts idle, so its first turn is news.
-          threadEvent("thread.session-set", "new"),
-          threadEvent("thread.session-set", "new"),
-          threadEvent("thread.turn-diff-completed", "new"),
-          // Messages never change the turn state, so they are not even read.
-          threadEvent("thread.message-sent", "new"),
+          sessionSet("done", "ready"),
+          // A thread created after the snapshot starts idle. Its turn has already ended by
+          // the time these events are handled, yet it still reports as running first.
+          sessionSet("fast", "starting"),
+          sessionSet("fast", "running"),
+          sessionSet("fast", "running"),
+          sessionSet("fast", "ready"),
+          // An interrupted turn stays interrupted when its session settles.
+          sessionSet("stopped", "running"),
+          threadEvent("thread.turn-interrupt-requested", "stopped", { turnId: "turn-1" }),
+          sessionSet("stopped", "ready"),
+          // Only the projection can tell how a checkpoint left the turn.
+          threadEvent("thread.turn-diff-completed", "broken"),
+          // Messages never change the turn state.
+          threadEvent("thread.message-sent", "fast"),
           threadEvent("thread.deleted", "done"),
         ],
-        threadsAfterEvents: {
-          done: [shell("done", "ready", "completed")],
-          new: [
-            shell("new", "running", "running"),
-            shell("new", "running", "running"),
-            shell("new", "ready", "completed"),
-          ],
+        projectedThreads: {
+          done: shell("done", "ready", "completed"),
+          fast: shell("fast", "ready", "completed"),
+          stopped: shell("stopped", "ready", "interrupted"),
+          broken: shell("broken", "ready", "error"),
         },
       });
       expect(yield* fixture.changes).toEqual([
-        { threadId: "new", projectId, state: "running" },
-        { threadId: "new", projectId, state: "completed" },
+        { threadId: "fast", projectId, state: "running" },
+        { threadId: "fast", projectId, state: "completed" },
+        { threadId: "stopped", projectId, state: "running" },
+        { threadId: "stopped", projectId, state: "interrupted" },
+        { threadId: "broken", projectId, state: "error" },
       ]);
     }),
   );
