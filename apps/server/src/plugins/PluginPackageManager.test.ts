@@ -560,6 +560,14 @@ export default function activate() {}
           expect(failure.message).toContain("screen board entry ./dist/index.html does not exist");
           expect((yield* catalog.list).screens).toEqual([]);
           expect(yield* manager.screen(packageId, "board")).toBeUndefined();
+          // A folder with the entry's name is not an entry file either.
+          yield* fileSystem.makeDirectory(`${packageDirectory}/dist/index.html`, {
+            recursive: true,
+          });
+          const folderFailure = yield* Effect.flip(manager.enable(packageId));
+          expect(folderFailure.message).toContain(
+            "screen board entry ./dist/index.html does not exist",
+          );
         }),
       );
     }),

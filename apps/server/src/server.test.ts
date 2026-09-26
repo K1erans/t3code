@@ -5983,7 +5983,12 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
             assert.equal(runtime.headers["content-type"], "text/javascript; charset=utf-8");
             assert.include(yield* runtime.text, "This screen must run inside T3 Code");
             assert.equal((yield* HttpClient.get(`${base}app.js`)).status, 200);
-            for (const escape of ["..%2Fsecret.js", ".hidden.js", "missing.js"]) {
+            for (const escape of [
+              "..%2Fsecret.js",
+              "x%2F..%2F..%2F..%2Fsecret.js",
+              ".hidden.js",
+              "missing.js",
+            ]) {
               assert.equal((yield* HttpClient.get(`${base}${escape}`)).status, 404);
             }
 

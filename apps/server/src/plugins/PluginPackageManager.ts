@@ -680,8 +680,8 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
           id,
         );
       }
-      const exists = yield* fileSystem.exists(entry).pipe(Effect.orElseSucceed(() => false));
-      if (!exists) {
+      const info = yield* fileSystem.stat(entry).pipe(Effect.option);
+      if (Option.isNone(info) || info.value.type !== "File") {
         return yield* operationError(
           operation,
           `screen ${screen.id} entry ${screen.entry} does not exist`,

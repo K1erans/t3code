@@ -145,6 +145,7 @@ const decodeSegments = (relativePath: string): ReadonlyArray<string> | undefined
       (segment) =>
         segment.length === 0 ||
         segment.startsWith(".") ||
+        segment.includes("/") ||
         segment.includes("\\") ||
         segment.includes("\0"),
     );
@@ -195,6 +196,8 @@ export const resolveScreenFile = Effect.fn("PluginScreenAccess.resolveScreenFile
   const contentType = CONTENT_TYPES[path.extname(segments.at(-1) ?? "").toLowerCase()];
   if (contentType === undefined) return undefined;
   const filePath = path.join(screen.root, ...segments);
+  // Segments are already checked; this guards the folder boundary itself.
+  if (!filePath.startsWith(`${screen.root}${path.sep}`)) return undefined;
   const fileSystem = yield* FileSystem.FileSystem;
   const info = yield* fileSystem.stat(filePath).pipe(Effect.option);
   if (Option.isNone(info) || info.value.type !== "File") return undefined;
@@ -209,8 +212,8 @@ const screenHeaders = (contentType: string): Record<string, string> => ({
   // Module scripts and fonts from an opaque origin are CORS requests with `Origin: null`.
   // The URL is the credential, so any origin may read it, never with cookies.
   "Access-Control-Allow-Origin": "*",
-  // Every mint is a new URL, so a cached response never outlives its token.
-  "Cache-Control": "private, max-age=86400, immutable",
+  // Revalidate every load, so a disable or reload revokes cached copies too.
+  "Cache-Control": "private, no-cache",
 });
 
 const serveScreenFile = Effect.gen(function* () {
