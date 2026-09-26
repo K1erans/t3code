@@ -69,12 +69,24 @@ export const PluginManifest = ClosedStruct({
   requires: Schema.Array(CapabilityId),
   surfaces: Schema.optional(Schema.Array(Schema.Literals(["web", "desktop", "mobile"]))),
   /**
-   * Plugins activate when one of their commands runs. `onStartup` also activates the
-   * plugin with the server and keeps it running; prefer the implicit triggers.
+   * Plugins activate when one of their commands runs. `onTurnStateChange` also wakes the
+   * plugin when a thread's turn state changes (it needs `t3.threads@0`). `onStartup`
+   * activates the plugin with the server and keeps it running; prefer the other triggers.
    */
-  activationEvents: Schema.optional(Schema.Array(Schema.Literal("onStartup"))),
+  activationEvents: Schema.optional(
+    Schema.Array(Schema.Literals(["onStartup", "onTurnStateChange"])),
+  ),
   entrypoints: Schema.optional(ClosedStruct({ server: Schema.optional(RelativeEntrypoint) })),
   contributes: Schema.optional(ClosedStruct({ commands: Schema.optional(CommandContributions) })),
-});
+}).pipe(
+  Schema.check(
+    Schema.makeFilter((manifest) =>
+      manifest.activationEvents?.includes("onTurnStateChange") &&
+      !manifest.requires.includes("t3.threads@0")
+        ? "activationEvents onTurnStateChange needs t3.threads@0 in requires"
+        : undefined,
+    ),
+  ),
+);
 
 export type PluginManifest = typeof PluginManifest.Type;

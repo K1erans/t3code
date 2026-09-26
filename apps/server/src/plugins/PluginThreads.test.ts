@@ -1,0 +1,322 @@
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import {
+  type OrchestrationCommand,
+  type OrchestrationEvent,
+  type OrchestrationProjectShell,
+  type OrchestrationThreadShell,
+  ProjectId,
+  ProviderInstanceId,
+  ThreadId,
+  type VcsStatusLocalResult,
+} from "@t3tools/contracts";
+import { it } from "@effect/vitest";
+import { expect } from "vite-plus/test";
+import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
+import * as Stream from "effect/Stream";
+
+import * as GitWorkflowService from "../git/GitWorkflowService.ts";
+import * as CommandDispatcher from "../orchestration/CommandDispatcher.ts";
+import * as OrchestrationEngine from "../orchestration/Services/OrchestrationEngine.ts";
+import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
+import * as T3ProjectFileLoader from "../project/T3ProjectFileLoader.ts";
+import * as ServerSettings from "../serverSettings.ts";
+import * as PluginThreads from "./PluginThreads.ts";
+
+const projectId = ProjectId.make("project-1");
+const project: OrchestrationProjectShell = {
+  id: projectId,
+  title: "Acme",
+  workspaceRoot: "/work/acme",
+  defaultModelSelection: null,
+  scripts: [],
+  createdAt: "2026-01-01T00:00:00.000Z",
+  updatedAt: "2026-01-01T00:00:00.000Z",
+};
+const codex = { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.5" };
+const claude = { instanceId: ProviderInstanceId.make("claudeAgent"), model: "claude-opus-5-5" };
+
+interface Fixture {
+  readonly settings?: Parameters<typeof ServerSettings.layerTest>[0];
+  readonly isRepo?: boolean;
+  /** Domain events the engine publishes after the plugin subscribes. */
+  readonly events?: ReadonlyArray<OrchestrationEvent>;
+  /** Threads in the shell snapshot taken when the plugin subscribes. */
+  readonly threads?: ReadonlyArray<OrchestrationThreadShell>;
+  /** Each thread's shell after each of its events, read in order. */
+  readonly threadsAfterEvents?: Record<string, Array<OrchestrationThreadShell>>;
+}
+
+/** `PluginThreads` over stub services, recording every command it dispatches. */
+const makeThreads = ({
+  settings = {},
+  isRepo = true,
+  events = [],
+  threads = [],
+  threadsAfterEvents = {},
+}: Fixture = {}) => {
+  const dispatched: Array<OrchestrationCommand> = [];
+  const layer = Layer.effect(PluginThreads.PluginThreads, PluginThreads.make).pipe(
+    Layer.provide(
+      Layer.mock(CommandDispatcher.CommandDispatcher)({
+        dispatch: (command) =>
+          Effect.sync(() => {
+            dispatched.push(command);
+            return { sequence: dispatched.length };
+          }),
+      }),
+    ),
+    Layer.provide(
+      Layer.mock(ProjectionSnapshotQuery.ProjectionSnapshotQuery)({
+        getProjectShells: () => Effect.succeed([project]),
+        getProjectShellById: (id) =>
+          Effect.succeed(id === projectId ? Option.some(project) : Option.none()),
+        getThreadShellById: (id) =>
+          Effect.sync(() => Option.fromNullishOr(threadsAfterEvents[id]?.shift())),
+        getShellSnapshot: () =>
+          Effect.succeed({
+            snapshotSequence: 0,
+            projects: [project],
+            threads,
+            updatedAt: project.updatedAt,
+          }),
+      }),
+    ),
+    Layer.provide(
+      Layer.mock(OrchestrationEngine.OrchestrationEngineService)({
+        subscribeDomainEvents: Effect.succeed(Stream.fromIterable(events)),
+      }),
+    ),
+    Layer.provide(
+      Layer.mock(T3ProjectFileLoader.T3ProjectFileLoader)({
+        load: () => Effect.succeedNone,
+      }),
+    ),
+    Layer.provide(
+      Layer.mock(GitWorkflowService.GitWorkflowService)({
+        localStatus: () =>
+          Effect.succeed({
+            isRepo,
+            hasPrimaryRemote: false,
+            isDefaultRef: true,
+            refName: isRepo ? "main" : null,
+            hasWorkingTreeChanges: false,
+            workingTree: { files: [], insertions: 0, deletions: 0 },
+          } as VcsStatusLocalResult),
+      }),
+    ),
+    Layer.provide(ServerSettings.layerTest(settings)),
+  );
+  const create = (input: typeof PluginThreads.PluginThreadCreateInput.Encoded) =>
+    PluginThreads.PluginThreads.pipe(
+      Effect.flatMap((threads) => threads.createThread(input)),
+      Effect.provide(layer),
+    );
+  const turnStart = () => {
+    const command = dispatched.at(-1);
+    if (command?.type !== "thread.turn.start") throw new Error("no thread.turn.start dispatched");
+    return command;
+  };
+  const changes = PluginThreads.PluginThreads.pipe(
+    Effect.flatMap((service) => service.turnStateChanges),
+    Effect.flatMap(Stream.runCollect),
+    Effect.scoped,
+    Effect.provide(layer),
+  );
+  return { create, changes, dispatched, turnStart };
+};
+
+const input = { projectId, title: "Fix the build", prompt: "The build is red, fix it." };
+
+it.layer(NodeServices.layer)("plugin threads", (it) => {
+  it.effect("starts a thread with the project's effective defaults", () =>
+    Effect.gen(function* () {
+      const fixture = makeThreads({
+        settings: {
+          defaultModelSelection: codex,
+          projectSettingsOverrides: {
+            [projectId]: { defaultModelSelection: claude, defaultRuntimeMode: "approval-required" },
+          },
+        },
+      });
+      const thread = yield* fixture.create(input);
+
+      expect(thread).toMatchObject({ projectId, title: "Fix the build", turnState: "running" });
+      const command = fixture.turnStart();
+      expect(command).toMatchObject({
+        threadId: thread.id,
+        message: { role: "user", text: input.prompt, attachments: [] },
+        modelSelection: claude,
+        runtimeMode: "approval-required",
+        interactionMode: "default",
+        bootstrap: {
+          createThread: {
+            projectId,
+            title: "Fix the build",
+            modelSelection: claude,
+            branch: "main",
+            worktreePath: null,
+          },
+        },
+      });
+      // The project defaults to the local checkout, and the plugin's title is kept.
+      expect(command.bootstrap?.prepareWorktree).toBeUndefined();
+      expect(command.titleSeed).toBeUndefined();
+    }),
+  );
+
+  it.effect("lets the plugin override every default", () =>
+    Effect.gen(function* () {
+      const fixture = makeThreads({
+        settings: { defaultModelSelection: codex, newWorktreesStartFromOrigin: true },
+      });
+      yield* fixture.create({
+        ...input,
+        model: claude,
+        runtimeMode: "approval-required",
+        interactionMode: "plan",
+        worktree: true,
+      });
+
+      const command = fixture.turnStart();
+      expect(command).toMatchObject({
+        modelSelection: claude,
+        runtimeMode: "approval-required",
+        interactionMode: "plan",
+        bootstrap: {
+          prepareWorktree: {
+            projectCwd: "/work/acme",
+            baseBranch: "main",
+            startFromOrigin: true,
+            requireWorktree: true,
+          },
+          runSetupScript: true,
+        },
+      });
+      expect(command.bootstrap?.prepareWorktree?.branch).toMatch(/^t3code\/[0-9a-f]{8}$/);
+    }),
+  );
+
+  it.effect("starts in a worktree when the project defaults to one", () =>
+    Effect.gen(function* () {
+      const fixture = makeThreads({
+        settings: { defaultModelSelection: codex, defaultThreadEnvMode: "worktree" },
+      });
+      yield* fixture.create(input);
+      const worktree = fixture.turnStart().bootstrap?.prepareWorktree;
+      expect(worktree).toMatchObject({ baseBranch: "main" });
+      // A default falls back to the checkout where a worktree is impossible.
+      expect(worktree?.requireWorktree).toBeUndefined();
+    }),
+  );
+
+  it.effect("uses the checkout when a worktree default meets a folder without Git", () =>
+    Effect.gen(function* () {
+      const fixture = makeThreads({
+        settings: { defaultModelSelection: codex, defaultThreadEnvMode: "worktree" },
+        isRepo: false,
+      });
+      yield* fixture.create(input);
+      expect(fixture.turnStart().bootstrap).toMatchObject({ createThread: { branch: null } });
+      expect(fixture.turnStart().bootstrap?.prepareWorktree).toBeUndefined();
+
+      const error = yield* Effect.flip(fixture.create({ ...input, worktree: true }));
+      expect(error.message).toContain("cannot start a worktree");
+    }),
+  );
+
+  it.effect("asks for a project default model when none is given or set", () =>
+    Effect.gen(function* () {
+      const fixture = makeThreads();
+      const error = yield* Effect.flip(fixture.create(input));
+      expect(error.message).toContain("Set a default model for this project");
+      expect(fixture.dispatched).toEqual([]);
+    }),
+  );
+
+  it.effect("rejects malformed input and unknown projects before dispatching", () =>
+    Effect.gen(function* () {
+      const fixture = makeThreads({ settings: { defaultModelSelection: codex } });
+      const blank = yield* Effect.flip(fixture.create({ ...input, prompt: "  " }));
+      expect(blank.message).toContain("Invalid threads.create input");
+      const missing = yield* Effect.flip(
+        fixture.create({ ...input, projectId: ProjectId.make("gone") }),
+      );
+      expect(missing.message).toBe("Project gone was not found");
+      expect(fixture.dispatched).toEqual([]);
+    }),
+  );
+});
+
+const threadShell = (
+  session: OrchestrationThreadShell["session"],
+  latestTurn: OrchestrationThreadShell["latestTurn"],
+) => ({ session, latestTurn });
+const session = (status: NonNullable<OrchestrationThreadShell["session"]>["status"]) =>
+  ({ status }) as NonNullable<OrchestrationThreadShell["session"]>;
+const turn = (state: NonNullable<OrchestrationThreadShell["latestTurn"]>["state"]) =>
+  ({ state }) as NonNullable<OrchestrationThreadShell["latestTurn"]>;
+
+it("derives a thread's turn state from its session and latest turn", () => {
+  expect(PluginThreads.turnStateOf(threadShell(null, null))).toBe("idle");
+  expect(PluginThreads.turnStateOf(threadShell(session("starting"), null))).toBe("running");
+  expect(PluginThreads.turnStateOf(threadShell(session("running"), turn("running")))).toBe(
+    "running",
+  );
+  expect(PluginThreads.turnStateOf(threadShell(session("ready"), turn("completed")))).toBe(
+    "completed",
+  );
+  expect(PluginThreads.turnStateOf(threadShell(session("ready"), turn("interrupted")))).toBe(
+    "interrupted",
+  );
+  expect(PluginThreads.turnStateOf(threadShell(session("error"), turn("error")))).toBe("error");
+});
+
+const shell = (
+  id: string,
+  status: NonNullable<OrchestrationThreadShell["session"]>["status"] | null,
+  turnState: NonNullable<OrchestrationThreadShell["latestTurn"]>["state"] | null,
+) =>
+  ({
+    id: ThreadId.make(id),
+    projectId,
+    session: status === null ? null : session(status),
+    latestTurn: turnState === null ? null : turn(turnState),
+  }) as OrchestrationThreadShell;
+const threadEvent = (type: OrchestrationEvent["type"], threadId: string) =>
+  ({ type, aggregateKind: "thread", aggregateId: threadId }) as OrchestrationEvent;
+
+it.layer(NodeServices.layer)("plugin turn state changes", (it) => {
+  it.effect("reports only real transitions, starting from the current states", () =>
+    Effect.gen(function* () {
+      const fixture = makeThreads({
+        // "done" already finished a turn before the plugin subscribed.
+        threads: [shell("done", "ready", "completed")],
+        events: [
+          // A session update that leaves the finished turn as it was.
+          threadEvent("thread.session-set", "done"),
+          // A thread created after the snapshot starts idle, so its first turn is news.
+          threadEvent("thread.session-set", "new"),
+          threadEvent("thread.session-set", "new"),
+          threadEvent("thread.turn-diff-completed", "new"),
+          // Messages never change the turn state, so they are not even read.
+          threadEvent("thread.message-sent", "new"),
+          threadEvent("thread.deleted", "done"),
+        ],
+        threadsAfterEvents: {
+          done: [shell("done", "ready", "completed")],
+          new: [
+            shell("new", "running", "running"),
+            shell("new", "running", "running"),
+            shell("new", "ready", "completed"),
+          ],
+        },
+      });
+      expect(yield* fixture.changes).toEqual([
+        { threadId: "new", projectId, state: "running" },
+        { threadId: "new", projectId, state: "completed" },
+      ]);
+    }),
+  );
+});

@@ -23,6 +23,7 @@ import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -36,6 +37,7 @@ import { writeFileStringAtomically } from "../atomicWrite.ts";
 import * as ServerConfig from "../config.ts";
 import * as PluginCommandCatalog from "./PluginCommandCatalog.ts";
 import * as PluginStorage from "./PluginStorage.ts";
+import * as PluginThreads from "./PluginThreads.ts";
 import {
   isHiddenPluginEntry,
   MANIFEST_FILE_NAME,
@@ -46,8 +48,14 @@ import {
 const COMMAND_CAPABILITY = "t3.commands@0";
 /** `api.storage` and `api.dataDir`. */
 const STORAGE_CAPABILITY = "t3.storage@0";
+/** `api.projects` and `api.threads`. */
+const THREADS_CAPABILITY = "t3.threads@0";
 /** Every host capability this T3 provides. A plugin requiring anything else fails activation. */
-const PROVIDED_CAPABILITIES: ReadonlyArray<string> = [COMMAND_CAPABILITY, STORAGE_CAPABILITY];
+const PROVIDED_CAPABILITIES: ReadonlyArray<string> = [
+  COMMAND_CAPABILITY,
+  STORAGE_CAPABILITY,
+  THREADS_CAPABILITY,
+];
 const MAX_REASON_LENGTH = 2_000;
 /** Environment-owned plugin state, shared by every client connected to this environment. */
 const PLUGIN_STATE_FILE_NAME = "plugins.json";
@@ -93,10 +101,19 @@ interface LoadedPlugin {
   readonly fingerprint: string;
 }
 
+type TurnStateListener = (change: PluginThreads.PluginTurnStateChange) => unknown;
+
 /** One activation of a loaded version, live in the runtime. */
 interface ActivePlugin {
   readonly loaded: LoadedPlugin;
   readonly definition: PluginDefinition;
+  /** Registered through `threads.onTurnStateChange`; they end with the activation. */
+  readonly turnListeners: Set<TurnStateListener>;
+  /**
+   * Changes run through the listeners one after another: `tail` settles once the
+   * last queued change has been handled. Nothing more runs once `retired` is set.
+   */
+  readonly turnDeliveries: { tail: Promise<void>; retired: boolean };
   /** Settles once the runtime has disposed this activation. */
   readonly retired: Promise<void>;
 }
@@ -122,6 +139,29 @@ export interface PluginPackageApi {
    * manifest, and running it activates the plugin first.
    */
   readonly registerCommand: (id: string, handler: () => unknown | Promise<unknown>) => void;
+  /** Present when the manifest requires `t3.threads@0`. */
+  readonly projects?: {
+    readonly list: () => Promise<ReadonlyArray<PluginThreads.PluginProject>>;
+    readonly get: (id: string) => Promise<PluginThreads.PluginProject | null>;
+  };
+  /** Present when the manifest requires `t3.threads@0`. */
+  readonly threads?: {
+    /**
+     * Creates a thread in `projectId` and starts its first turn with `prompt`. Options left
+     * out fall back to the project's defaults for new threads; with no model given and no
+     * project default model it rejects.
+     */
+    readonly create: (
+      input: typeof PluginThreads.PluginThreadCreateInput.Encoded,
+    ) => Promise<PluginThreads.PluginThread>;
+    readonly get: (id: string) => Promise<PluginThreads.PluginThread | null>;
+    /**
+     * Calls `listener` whenever a thread's turn state changes, and returns a function that
+     * stops it. With `onTurnStateChange` in `activationEvents`, a change wakes the plugin
+     * and is delivered once `activate` has registered its listener.
+     */
+    readonly onTurnStateChange: (listener: TurnStateListener) => () => void;
+  };
 }
 
 type PluginPackageActivator = (api: PluginPackageApi) => void | Promise<void>;
@@ -151,6 +191,10 @@ export interface PluginPackageManagerOptions {
 
 const startsWithServer = (manifest: PluginManifest) =>
   manifest.activationEvents?.includes("onStartup") === true;
+
+const wakesOnTurnStateChange = (manifest: PluginManifest) =>
+  manifest.requires.includes(THREADS_CAPABILITY) &&
+  manifest.activationEvents?.includes("onTurnStateChange") === true;
 
 /** The palette entries a manifest declares, listed whether or not the plugin is active. */
 const declaredCommands = (manifest: PluginManifest): ReadonlyArray<PluginCommand> => {
@@ -225,21 +269,27 @@ const failOperation =
       Effect.andThen(Effect.fail(operationError(operation, error, id))),
     );
 
+/** Which kind of plugin code failed; a failed command or listener retires its plugin. */
+type FailedEntryPoint = "command" | "listener" | "dispose";
+
 interface DefinitionHooks {
   readonly guard: EntryPointGuard;
   readonly run: <A>(effect: Effect.Effect<A, PluginEntryPointError>) => Promise<A>;
-  /** A command or cleanup of `definition` failed; commands also retire it. */
+  /** Runs a host operation for plugin code, rejecting with its readable reason. */
+  readonly callHost: <A>(effect: Effect.Effect<A, PluginThreads.PluginThreadsError>) => Promise<A>;
+  readonly threads: PluginThreads.PluginThreads["Service"];
+  readonly turnListeners: Set<TurnStateListener>;
   readonly onFailure: (
     definition: PluginDefinition,
     reason: string,
-    entryPoint: "command" | "dispose",
+    entryPoint: FailedEntryPoint,
   ) => void;
   readonly onRetired: () => void;
 }
 
 const makeDefinition = (
   loaded: LoadedPlugin,
-  { guard, run, onFailure, onRetired }: DefinitionHooks,
+  { guard, run, callHost, threads, turnListeners, onFailure, onRetired }: DefinitionHooks,
 ): PluginDefinition => {
   const declaredIds = new Set(declaredCommands(loaded.manifest).map((command) => command.id));
   const requires = new Set(loaded.manifest.requires);
@@ -251,6 +301,30 @@ const makeDefinition = (
       context.onDispose(onRetired);
       const api: PluginPackageApi = {
         ...loaded.data,
+        ...(requires.has(THREADS_CAPABILITY)
+          ? {
+              projects: {
+                list: () => callHost(threads.listProjects),
+                get: (id) => callHost(threads.getProject(id)),
+              },
+              threads: {
+                create: (input) => callHost(threads.createThread(input)),
+                get: (id) => callHost(threads.getThread(id)),
+                onTurnStateChange(listener) {
+                  if (typeof listener !== "function") {
+                    throw new TypeError("onTurnStateChange needs a listener function");
+                  }
+                  // Each registration is its own entry, so registering one function twice
+                  // calls it twice and each returned function stops one of them.
+                  const entry: TurnStateListener = (change) => listener(change);
+                  turnListeners.add(entry);
+                  return () => {
+                    turnListeners.delete(entry);
+                  };
+                },
+              },
+            }
+          : {}),
         onDispose(cleanup) {
           context.onDispose(() =>
             run(
@@ -381,6 +455,8 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
   const path = yield* Path.Path;
   const config = yield* ServerConfig.ServerConfig;
   const catalog = yield* PluginCommandCatalog.PluginCommandCatalog;
+  const threads = yield* PluginThreads.PluginThreads;
+  const managerScope = yield* Effect.scope;
   // Serializes enable, disable, reload, rescan and retirement. Status and commands never take it.
   const semaphore = yield* Semaphore.make(1);
   const pluginsDirectory = path.join(config.stateDir, "plugins");
@@ -400,13 +476,17 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
   // Per active package: running commands, and when the last one started or finished.
   const usage = new Map<PluginPackageId, { running: number; lastUsedAt: number }>();
   const packageErrors = new Map<PluginPackageId, PackageError>();
-  // Live versions with a failed command, retired once the invocation returns.
+  // Live versions with a failed command or listener, retired once the call returns.
   const failedCommands = new Set<PluginDefinition>();
   // The folder fingerprint of each package's last failed load, so rescans and watch
   // events do not re-import unchanged broken code.
   const failedFingerprints = new Map<PluginPackageId, string>();
   const entryPointTimeout = Duration.fromInputUnsafe(options.entryPointTimeout ?? "30 seconds");
   const runEntryPoint = Effect.runPromiseWith(yield* Effect.context<never>());
+  const callHost = <A>(effect: Effect.Effect<A, PluginThreads.PluginThreadsError>) =>
+    runEntryPoint(Effect.exit(effect)).then((exit) =>
+      Exit.isSuccess(exit) ? exit.value : Promise.reject(new Error(detailFromCause(exit.cause))),
+    );
   let loadSequence = 0;
   // True until the startup rescan has run, so enabled packages it has not loaded show as starting.
   let starting = true;
@@ -461,12 +541,12 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
   const recordEntryPointFailure = (
     definition: PluginDefinition,
     reason: string,
-    entryPoint: "command" | "dispose",
+    entryPoint: FailedEntryPoint,
   ) => {
     const current = active.get(definition.id);
     if (current?.definition !== definition) return;
     packageErrors.set(definition.id, { reason, source: current.loaded });
-    if (entryPoint === "command") failedCommands.add(definition);
+    if (entryPoint !== "dispose") failedCommands.add(definition);
   };
 
   const removeCacheDirectory = (directory: string) =>
@@ -702,14 +782,24 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
     const retired = new Promise<void>((resolve) => {
       markRetired = resolve;
     });
+    const turnListeners = new Set<TurnStateListener>();
+    const turnDeliveries = { tail: Promise.resolve(), retired: false };
     return {
       loaded: version,
       definition: makeDefinition(version, {
         guard: guardEntryPoint(version.manifest.id),
         run: runEntryPoint,
+        callHost,
+        threads,
+        turnListeners,
         onFailure: recordEntryPointFailure,
-        onRetired: markRetired,
+        onRetired: () => {
+          turnDeliveries.retired = true;
+          markRetired();
+        },
       }),
+      turnListeners,
+      turnDeliveries,
       retired,
     };
   };
@@ -723,6 +813,44 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
         .flatMap((version) => declaredCommands(version.manifest)),
     ),
   );
+
+  // Follows turn state changes only while a loaded plugin can read threads, so
+  // environments without such plugins never look anything up.
+  let turnStateWatch: Fiber.Fiber<void> | undefined;
+  const watchTurnStates = Effect.scoped(
+    Effect.gen(function* () {
+      const changes = yield* threads.turnStateChanges;
+      yield* Stream.runForEach(changes, (change) =>
+        Effect.forEach(
+          [...loaded.values()].filter(listensToThreads),
+          (version) => deliverTurnStateChange(version, change),
+          { concurrency: "unbounded", discard: true },
+        ),
+      );
+    }),
+  ).pipe(Effect.interruptible, Effect.ignoreCause({ log: true }));
+
+  /** Starts or stops the turn state watch to match the loaded packages. */
+  const syncTurnStateWatch = Effect.suspend(() => {
+    const wanted = [...loaded.values()].some(listensToThreads);
+    // A watch that failed (say, its first read) ended; the next sync starts a new one.
+    const running = turnStateWatch !== undefined && turnStateWatch.pollUnsafe() === undefined;
+    if (wanted && !running) {
+      return watchTurnStates.pipe(
+        Effect.forkIn(managerScope),
+        Effect.map((fiber) => {
+          turnStateWatch = fiber;
+        }),
+      );
+    }
+    if (!wanted && turnStateWatch !== undefined) {
+      const stopping = turnStateWatch;
+      turnStateWatch = undefined;
+      // Not awaited: a delivery may be waiting on the lock the caller holds.
+      return Fiber.interrupt(stopping).pipe(Effect.forkIn(managerScope), Effect.asVoid);
+    }
+    return Effect.void;
+  });
 
   /**
    * Makes `next` the loaded version of `id`, or unloads it, removing the replaced
@@ -744,6 +872,7 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
     if (previous !== undefined && previous !== next) {
       yield* removeCacheDirectory(previous.cacheDirectory);
     }
+    yield* syncTurnStateWatch;
   });
 
   const readEnabledIds = (operation: PluginPackageOperation, id?: PluginPackageId) =>
@@ -1114,6 +1243,68 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
     const definition = owner === undefined ? undefined : active.get(owner)?.definition;
     return definition !== undefined && failedCommands.has(definition) ? definition : undefined;
   };
+
+  const listensToThreads = (version: LoadedPlugin) =>
+    version.manifest.requires.includes(THREADS_CAPABILITY);
+
+  /**
+   * Hands `change` to `version`'s turn state listeners, first activating it if it is
+   * idle and declares `onTurnStateChange`, so the triggering change reaches the listener
+   * its `activate` registered. Each plugin handles its changes in order, one after
+   * another, off the watch fiber, so a slow listener holds back only its own plugin.
+   * A queued change counts as activity until it has been handled.
+   */
+  const deliverTurnStateChange = (
+    version: LoadedPlugin,
+    change: PluginThreads.PluginTurnStateChange,
+  ) =>
+    Effect.gen(function* () {
+      const id = version.manifest.id;
+      if (active.get(id)?.loaded !== version) {
+        if (!wakesOnTurnStateChange(version.manifest)) return;
+        // A version that failed stays down until Reload or an edit.
+        if (packageErrors.get(id)?.source === version) return;
+        yield* touch(id, 0);
+        const woke = yield* Effect.exit(ensureActive(id));
+        if (Exit.isFailure(woke)) {
+          yield* Effect.logWarning(
+            "Failed to activate local plugin package on a turn state change",
+            {
+              id,
+              error: detailFromCause(woke.cause),
+            },
+          );
+          return;
+        }
+      }
+      const current = active.get(id);
+      if (current === undefined || current.turnListeners.size === 0) return;
+      const guard = guardEntryPoint(id);
+      const handle = Effect.gen(function* () {
+        for (const listener of current.turnListeners) {
+          if (current.turnDeliveries.retired) return;
+          const handled = yield* Effect.exit(
+            guard("turn state listener", () => listener(structuredClone(change))),
+          );
+          if (Exit.isFailure(handled)) {
+            recordEntryPointFailure(current.definition, detailFromCause(handled.cause), "listener");
+            return;
+          }
+        }
+      }).pipe(
+        Effect.ensuring(touch(id, -1)),
+        Effect.andThen(
+          Effect.suspend(() =>
+            failedCommands.has(current.definition)
+              ? semaphore.withPermits(1)(retireFailedCommand(current.definition))
+              : Effect.void,
+          ),
+        ),
+      );
+      yield* touch(id, 1);
+      const deliveries = current.turnDeliveries;
+      deliveries.tail = deliveries.tail.then(() => runEntryPoint(handle));
+    });
 
   const rescanUnlocked = Effect.fn("PluginPackageManager.rescan")(function* () {
     const discovery = yield* discover("rescan");
