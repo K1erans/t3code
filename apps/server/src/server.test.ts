@@ -5932,6 +5932,11 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         "outside the screen folder",
       );
       yield* fileSystem.writeFileString(path.join(screenDirectory, "index.html"), "<p>board</p>");
+      yield* fileSystem.makeDirectory(path.join(screenDirectory, "pages"));
+      yield* fileSystem.writeFileString(
+        path.join(screenDirectory, "pages", "settings.html"),
+        "<!doctype html><head><title>Settings</title></head>",
+      );
       yield* fileSystem.writeFileString(path.join(screenDirectory, "app.js"), "export {};");
       const wsUrl = yield* getWsServerUrl("/ws");
 
@@ -5964,7 +5969,11 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
               headers: { origin: "null" },
             });
             assert.equal(entry.status, 200);
-            assert.equal(yield* entry.text, "<p>board</p>");
+            // Every page links T3's base stylesheet and runtime first, relative to the token's root.
+            assert.equal(
+              yield* entry.text,
+              '<link rel="stylesheet" href="_t3/base.css"><script type="module" src="_t3/screen.js"></script><p>board</p>',
+            );
             assert.equal(entry.headers["content-type"], "text/html; charset=utf-8");
             assert.match(
               entry.headers["content-security-policy"] ?? "",
@@ -5982,6 +5991,16 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
             assert.equal(runtime.status, 200);
             assert.equal(runtime.headers["content-type"], "text/javascript; charset=utf-8");
             assert.include(yield* runtime.text, "This screen must run inside T3 Code");
+            const baseStylesheet = yield* HttpClient.get(`${base}_t3/base.css`);
+            assert.equal(baseStylesheet.status, 200);
+            assert.equal(baseStylesheet.headers["content-type"], "text/css; charset=utf-8");
+            assert.include(yield* baseStylesheet.text, "var(--t3-color-canvas)");
+            const nested = yield* HttpClient.get(`${base}pages/settings.html`);
+            assert.equal(
+              yield* nested.text,
+              '<!doctype html><head><link rel="stylesheet" href="../_t3/base.css"><script type="module" src="../_t3/screen.js"></script><title>Settings</title></head>',
+            );
+            assert.equal(nested.headers["content-type"], "text/html; charset=utf-8");
             assert.equal((yield* HttpClient.get(`${base}app.js`)).status, 200);
             for (const escape of [
               "..%2Fsecret.js",

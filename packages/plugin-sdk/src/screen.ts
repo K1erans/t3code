@@ -12,6 +12,10 @@ export interface ScreenContext {
   readonly placement: "panel";
   /** The project beside the screen, or null for an environment-scoped screen. */
   readonly projectId: string | null;
+  /**
+   * The appearance when the screen connected. T3 keeps the live theme on the page root
+   * itself: `--t3-*` tokens, `color-scheme` and `data-t3-appearance`.
+   */
   readonly theme: { readonly appearance: "light" | "dark" };
 }
 

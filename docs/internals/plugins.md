@@ -75,6 +75,18 @@ app's own origin, which is why screens must never get `allow-same-origin`: the C
 and the iframe attribute both give them an opaque origin. Screens are static files and never
 activate their plugin.
 
+## Screens wear T3's theme without asking
+
+A sandboxed frame cannot read T3's stylesheets, so the host posts its resolved design variables,
+renamed to public `--t3-*` tokens in
+[`pluginScreenTheme.ts`](../../apps/web/src/components/plugins/pluginScreenTheme.ts), and the
+runtime sets them on the frame root. The server links `_t3/base.css` and `_t3/screen.js` first in
+every HTML page it serves, so a screen that never calls `connect()` still looks like T3, and its own
+styles still win the cascade. The link is relative to the page, so it resolves to the same URL the
+SDK loader imports and both share one runtime module. Tokens belong to `t3.screens@0`: add them
+freely, but never rename or remove one, and keep T3-layout roles (sidebar, toolbar, terminal,
+message actions) out.
+
 ## Plugin data outlives its plugin
 
 `plugin-data/<id>/` is never touched by disable, reload or reinstall. Only two things remove it:

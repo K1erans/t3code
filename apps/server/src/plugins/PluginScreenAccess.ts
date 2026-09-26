@@ -30,6 +30,7 @@ import {
   timingSafeEqualBase64Url,
 } from "../auth/utils.ts";
 import * as PluginPackageManager from "./PluginPackageManager.ts";
+import { SCREEN_BASE_STYLESHEET_SOURCE } from "./screenBaseStyles.ts";
 import { SCREEN_RUNTIME_SOURCE } from "./screenRuntime.ts";
 
 export const PLUGIN_SCREEN_ROUTE_PREFIX = "/api/plugins";
@@ -38,6 +39,7 @@ const SIGNING_SECRET_NAME = "plugin-screen-signing-key";
 /** Long enough that an open screen can lazy-load chunks; reloads mint a new URL anyway. */
 const TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
 const RUNTIME_PATH = "_t3/screen.js";
+const BASE_STYLESHEET_PATH = "_t3/base.css";
 
 // The header also sandboxes the document when it is opened directly, outside any frame.
 const SCREEN_CONTENT_SECURITY_POLICY = [
@@ -137,7 +139,33 @@ export const issueScreenUrl = Effect.fn("PluginScreenAccess.issueScreenUrl")(fun
 
 type ResolvedScreenFile =
   | { readonly kind: "runtime" }
-  | { readonly kind: "file"; readonly path: string; readonly contentType: string };
+  | { readonly kind: "base-stylesheet" }
+  | {
+      readonly kind: "file";
+      readonly path: string;
+      readonly contentType: string;
+      /** Folders between the file and the token's root, where `_t3/` lives. */
+      readonly depth: number;
+    };
+
+const HEAD_OPEN = /<head(?:\s[^>]*)?>/i;
+const HTML_OPEN = /<html(?:\s[^>]*)?>/i;
+const LEADING_DOCTYPE = /^\s*<!doctype[^>]*>/i;
+
+/**
+ * Links the base stylesheet and the runtime first in a page, so every screen looks like T3
+ * and follows its theme without calling `connect()`, and its own styles still win. The
+ * runtime is imported by the same URL the SDK loader uses, so both share one module.
+ */
+export const injectScreenHost = (html: string, depth: number): string => {
+  const root = "../".repeat(depth);
+  const tags = `<link rel="stylesheet" href="${root}${BASE_STYLESHEET_PATH}"><script type="module" src="${root}${RUNTIME_PATH}"></script>`;
+  // Nothing may precede the doctype, or the page falls into quirks mode.
+  const anchor = HEAD_OPEN.exec(html) ?? HTML_OPEN.exec(html) ?? LEADING_DOCTYPE.exec(html);
+  if (anchor === null) return `${tags}${html}`;
+  const at = anchor.index + anchor[0].length;
+  return `${html.slice(0, at)}${tags}${html.slice(at)}`;
+};
 
 /** Path segments under the screen folder, or undefined for anything that could escape it. */
 const decodeSegments = (relativePath: string): ReadonlyArray<string> | undefined => {
@@ -191,6 +219,9 @@ export const resolveScreenFile = Effect.fn("PluginScreenAccess.resolveScreenFile
     return undefined;
   }
   if (relativePath === RUNTIME_PATH) return { kind: "runtime" } satisfies ResolvedScreenFile;
+  if (relativePath === BASE_STYLESHEET_PATH) {
+    return { kind: "base-stylesheet" } satisfies ResolvedScreenFile;
+  }
 
   const segments = decodeSegments(relativePath);
   if (segments === undefined) return undefined;
@@ -203,7 +234,12 @@ export const resolveScreenFile = Effect.fn("PluginScreenAccess.resolveScreenFile
   const fileSystem = yield* FileSystem.FileSystem;
   const info = yield* fileSystem.stat(filePath).pipe(Effect.option);
   if (Option.isNone(info) || info.value.type !== "File") return undefined;
-  return { kind: "file", path: filePath, contentType } satisfies ResolvedScreenFile;
+  return {
+    kind: "file",
+    path: filePath,
+    contentType,
+    depth: segments.length - 1,
+  } satisfies ResolvedScreenFile;
 });
 
 const screenHeaders = (contentType: string): Record<string, string> => ({
@@ -235,6 +271,22 @@ const serveScreenFile = Effect.gen(function* () {
     return HttpServerResponse.text(SCREEN_RUNTIME_SOURCE, {
       headers: screenHeaders("text/javascript; charset=utf-8"),
     });
+  }
+  if (resolved.kind === "base-stylesheet") {
+    return HttpServerResponse.text(SCREEN_BASE_STYLESHEET_SOURCE, {
+      headers: screenHeaders("text/css; charset=utf-8"),
+    });
+  }
+  if (resolved.contentType.startsWith("text/html")) {
+    const fileSystem = yield* FileSystem.FileSystem;
+    return yield* fileSystem.readFileString(resolved.path).pipe(
+      Effect.map((html) =>
+        HttpServerResponse.text(injectScreenHost(html, resolved.depth), {
+          headers: screenHeaders(resolved.contentType),
+        }),
+      ),
+      Effect.orElseSucceed(() => HttpServerResponse.text("Internal Server Error", { status: 500 })),
+    );
   }
   return yield* HttpServerResponse.file(resolved.path, {
     headers: screenHeaders(resolved.contentType),
