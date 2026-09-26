@@ -75,6 +75,15 @@ app's own origin, which is why screens must never get `allow-same-origin`: the C
 and the iframe attribute both give them an opaque origin. Screens are static files and never
 activate their plugin.
 
+## Screen theme tokens are public API
+
+The `--t3-*` tokens in
+[`pluginScreenTheme.ts`](../../apps/web/src/components/plugins/pluginScreenTheme.ts) belong to
+`t3.screens@0`: add them freely, but never rename or remove one, and keep T3-layout roles (sidebar,
+toolbar, terminal, message actions) out. The server links the runtime into every page relative to
+that page, so it resolves to the URL the SDK loader imports; an absolute or differently spelled URL
+would load a second runtime module with its own handshake.
+
 ## Plugin data outlives its plugin
 
 `plugin-data/<id>/` is never touched by disable, reload or reinstall. Only two things remove it:

@@ -5,7 +5,8 @@
  * The frame loads a signed URL from the thread's environment inside an opaque-origin
  * sandbox. The screen's runtime (`apps/server/src/plugins/screenRuntime.ts`) announces
  * itself with a message from the frame's window, and the host answers with the screen's
- * context. The frame is recognized by `event.source`, never by origin, which is `"null"`.
+ * context and theme, then sends the theme again whenever it changes. The frame is
+ * recognized by `event.source`, never by origin, which is `"null"`.
  */
 import { useAtomRefresh, useAtomValue } from "@effect/atom-react";
 import {
@@ -17,7 +18,7 @@ import { type EnvironmentId, PLUGIN_SCREEN_SANDBOX, type PluginScreen } from "@t
 import * as Option from "effect/Option";
 import { AsyncResult } from "effect/unstable/reactivity";
 import { PuzzleIcon } from "lucide-react";
-import { type ReactNode, useEffect, useRef, useState } from "react";
+import { type ReactNode, useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import { Button } from "~/components/ui/button";
 import {
@@ -29,7 +30,6 @@ import {
   EmptyTitle,
 } from "~/components/ui/empty";
 import { toastManager } from "~/components/ui/toast";
-import { useTheme } from "~/hooks/useTheme";
 import { useEnvironmentQuery } from "~/state/query";
 import { serverEnvironment } from "~/state/server";
 import { usePreparedConnection } from "~/state/session";
@@ -37,6 +37,7 @@ import { useAtomCommand } from "~/state/use-atom-command";
 
 import { useEnvironmentOperateAccess } from "../settings/EnvironmentIconPicker";
 import { pluginActionErrorText } from "../settings/PluginsSettings.logic";
+import { readScreenTheme, sameScreenTheme, type ScreenTheme } from "./pluginScreenTheme";
 
 /** How long before its token expires an open screen fetches a new URL. */
 const URL_RENEW_MARGIN_MS = 10 * 60 * 1000;
@@ -110,29 +111,57 @@ function PluginScreenFrame(props: {
     const timer = setTimeout(refreshUrl, delay);
     return () => clearTimeout(timer);
   }, [expiresAt, renewalFailed, refreshUrl]);
-  const { resolvedTheme } = useTheme();
   const frameRef = useRef<HTMLIFrameElement>(null);
-  const context = {
-    placement: screen.placement,
-    projectId: props.projectId,
-    theme: { appearance: resolvedTheme },
-  };
-  // The handshake can arrive at any time after render; it reads the latest context.
-  const contextRef = useRef(context);
-  useEffect(() => {
-    contextRef.current = context;
-  });
+  const { placement } = screen;
+  const { projectId } = props;
 
-  useEffect(() => {
-    const onMessage = (event: MessageEvent) => {
-      const frame = frameRef.current?.contentWindow;
-      if (frame == null || event.source !== frame) return;
-      if (typeof event.data !== "object" || event.data?.type !== "t3-screen:hello") return;
-      frame.postMessage({ type: "t3-screen:init", context: contextRef.current }, "*");
+  // A layout effect, so the listener exists in the same task that inserts the frame: the
+  // frame's greeting is a posted message, delivered in a later task, and is never missed.
+  useLayoutEffect(() => {
+    // The theme the frame last received, or null until it was first sent. A page navigating
+    // inside the frame is sent everything afresh.
+    let lastSent: ScreenTheme | null = null;
+    const sendInit = () => {
+      const element = frameRef.current;
+      const frame = element?.contentWindow;
+      if (element == null || frame == null) return;
+      lastSent = readScreenTheme(element);
+      frame.postMessage(
+        {
+          type: "t3-screen:init",
+          context: { placement, projectId, theme: { appearance: lastSent.appearance } },
+          tokens: lastSent.tokens,
+        },
+        "*",
+      );
     };
+    // The runtime greets the host when it loads, or when the SDK loads it later. Only a page
+    // that greets the host is told its context.
+    const onMessage = (event: MessageEvent) => {
+      if (event.source == null || event.source !== frameRef.current?.contentWindow) return;
+      if (typeof event.data !== "object" || event.data?.type !== "t3-screen:hello") return;
+      sendInit();
+    };
+    // Theme, appearance, contrast and text size settings all land on the root element.
+    const observer = new MutationObserver(() => {
+      const element = frameRef.current;
+      const frame = element?.contentWindow;
+      if (lastSent === null || element == null || frame == null) return;
+      const theme = readScreenTheme(element);
+      if (sameScreenTheme(theme, lastSent)) return;
+      lastSent = theme;
+      frame.postMessage({ type: "t3-screen:theme", ...theme }, "*");
+    });
+    observer.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ["class", "style", "data-theme-id"],
+    });
     window.addEventListener("message", onMessage);
-    return () => window.removeEventListener("message", onMessage);
-  }, []);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("message", onMessage);
+    };
+  }, [placement, projectId]);
 
   if (current === undefined && minted._tag === "Failure") {
     return (
