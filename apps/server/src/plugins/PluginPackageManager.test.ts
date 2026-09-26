@@ -5,6 +5,7 @@ import { expect } from "vite-plus/test";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -22,6 +23,7 @@ import * as ServerConfig from "../config.ts";
 import * as PluginCommandCatalog from "./PluginCommandCatalog.ts";
 import { installPlugin, removePlugin } from "./PluginInstall.ts";
 import * as PluginPackageManager from "./PluginPackageManager.ts";
+import * as PluginThreads from "./PluginThreads.ts";
 
 const packageId = "com.example.fixture";
 const commandId = "fixture.say-hello";
@@ -117,14 +119,28 @@ export default function activate(api) {
 
 interface EnvironmentLayerOptions {
   readonly entryPointTimeout?: Duration.Input;
+  readonly threads?: PluginThreads.PluginThreads["Service"];
 }
+
+/** Thread access for tests that do not use it: no projects, threads or turn state changes. */
+const noThreads = PluginThreads.PluginThreads.of({
+  listProjects: Effect.succeed([]),
+  getProject: () => Effect.succeed(null),
+  createThread: () => Effect.fail(new PluginThreads.PluginThreadsError({ reason: "no threads" })),
+  getThread: () => Effect.succeed(null),
+  turnStateChanges: Effect.succeed(Stream.never),
+});
 
 const makeEnvironmentLayer = (baseDir: string, options?: EnvironmentLayerOptions) => {
   const configLayer = Layer.fresh(ServerConfig.layerTest(process.cwd(), baseDir));
   const entryPointTimeout = options?.entryPointTimeout;
   return PluginPackageManager.layerWith(
     entryPointTimeout === undefined ? {} : { entryPointTimeout },
-  ).pipe(Layer.provideMerge(PluginCommandCatalog.layer), Layer.provideMerge(configLayer));
+  ).pipe(
+    Layer.provideMerge(PluginCommandCatalog.layer),
+    Layer.provide(Layer.succeed(PluginThreads.PluginThreads, options?.threads ?? noThreads)),
+    Layer.provideMerge(configLayer),
+  );
 };
 
 const useEnvironment = <A, E>(
@@ -506,7 +522,7 @@ export default function activate() {}
 `,
       );
       const reason =
-        "Needs t3.screens@2; this T3 provides t3.commands@0, t3.screens@0, t3.storage@0. Update T3 or use an older version of the plugin.";
+        "Needs t3.screens@2; this T3 provides t3.commands@0, t3.screens@0, t3.storage@0, t3.threads@0. Update T3 or use an older version of the plugin.";
 
       yield* useEnvironment(
         baseDir,
@@ -2242,6 +2258,321 @@ export default async function activate(api) {
       expect(yield* Queue.size(subscriptions)).toBe(0);
       yield* TestClock.adjust("1 millis");
       expect(yield* Queue.take(subscriptions)).toBe(6);
+    }),
+  );
+});
+
+const threadsManifest = (id: string, extra: Record<string, unknown>) => {
+  const { contributes: _contributes, ...base } = manifest;
+  return encodeManifest({ ...base, id, requires: ["t3.threads@0"], ...extra });
+};
+
+it.layer(NodeServices.layer)("plugin thread access", (it) => {
+  it.effect("wakes onTurnStateChange plugins with the change that triggered them", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3code-plugin-package-turn-state-test-",
+      });
+      const changes = yield* Queue.unbounded<PluginThreads.PluginTurnStateChange>();
+      const hookSymbol = `t3.test.plugin.turn-state.${baseDir}`;
+      let markReceived!: (change: unknown) => void;
+      const received = new Promise<unknown>((resolve) => {
+        markReceived = resolve;
+      });
+      const hook = { activations: { waker: 0, sleeper: 0 }, received: markReceived };
+      yield* Effect.acquireRelease(
+        Effect.sync(() => Reflect.set(globalThis, Symbol.for(hookSymbol), hook)),
+        () => Effect.sync(() => Reflect.deleteProperty(globalThis, Symbol.for(hookSymbol))),
+      );
+      const listenerSource = (name: string) => `
+export default function activate(api) {
+  const hook = globalThis[Symbol.for(${encodeJsonString(hookSymbol)})];
+  hook.activations.${name} += 1;
+  api.threads.onTurnStateChange((change) => hook.received({ name: "${name}", change }));
+}
+`;
+      const packages = [
+        {
+          id: "com.example.waker",
+          name: "waker",
+          extra: { activationEvents: ["onTurnStateChange"] },
+        },
+        { id: "com.example.sleeper", name: "sleeper", extra: {} },
+      ];
+      for (const plugin of packages) {
+        const directory = yield* writePackage(
+          baseDir,
+          plugin.id,
+          commandId,
+          listenerSource(plugin.name),
+        );
+        yield* fileSystem.writeFileString(
+          `${directory}/t3-plugin.json`,
+          threadsManifest(plugin.id, plugin.extra),
+        );
+      }
+      yield* fileSystem.writeFileString(
+        `${baseDir}/userdata/plugins.json`,
+        `{"enabled":["com.example.sleeper","com.example.waker"]}\n`,
+      );
+      const threads = PluginThreads.PluginThreads.of({
+        ...noThreads,
+        turnStateChanges: Effect.succeed(Stream.fromQueue(changes)),
+      });
+
+      yield* useEnvironment(
+        baseDir,
+        Effect.gen(function* () {
+          const manager = yield* PluginPackageManager.PluginPackageManager;
+          expect(yield* manager.rescan).toMatchObject({
+            packages: [{ state: "idle" }, { state: "idle" }],
+          });
+          expect(hook.activations).toEqual({ waker: 0, sleeper: 0 });
+
+          const change = {
+            threadId: "thread-1",
+            projectId: "project-1",
+            state: "running",
+          } as const;
+          yield* Queue.offer(changes, change);
+          expect(yield* Effect.promise(() => received)).toEqual({ name: "waker", change });
+          // Only the plugin that asked to wake on turn state changes activated.
+          expect(hook.activations).toEqual({ waker: 1, sleeper: 0 });
+          expect(yield* manager.status).toMatchObject({
+            packages: [
+              { id: "com.example.sleeper", state: "idle" },
+              { id: "com.example.waker", state: "active" },
+            ],
+          });
+        }),
+        { threads },
+      );
+    }),
+  );
+
+  it.effect("keeps following turn state changes after the watch fails to start", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3code-plugin-package-turn-watch-retry-test-",
+      });
+      const changes = yield* Queue.unbounded<PluginThreads.PluginTurnStateChange>();
+      const hookSymbol = `t3.test.plugin.turn-watch-retry.${baseDir}`;
+      let markReceived!: (change: unknown) => void;
+      const received = new Promise<unknown>((resolve) => {
+        markReceived = resolve;
+      });
+      yield* Effect.acquireRelease(
+        Effect.sync(() => Reflect.set(globalThis, Symbol.for(hookSymbol), markReceived)),
+        () => Effect.sync(() => Reflect.deleteProperty(globalThis, Symbol.for(hookSymbol))),
+      );
+      const directory = yield* writePackage(
+        baseDir,
+        packageId,
+        commandId,
+        `export default function activate(api) {
+  api.threads.onTurnStateChange(globalThis[Symbol.for(${encodeJsonString(hookSymbol)})]);
+}
+`,
+      );
+      yield* fileSystem.writeFileString(
+        `${directory}/t3-plugin.json`,
+        threadsManifest(packageId, { activationEvents: ["onTurnStateChange"] }),
+      );
+      yield* fileSystem.writeFileString(
+        `${baseDir}/userdata/plugins.json`,
+        `{"enabled":["${packageId}"]}\n`,
+      );
+      let subscriptions = 0;
+      const threads = PluginThreads.PluginThreads.of({
+        ...noThreads,
+        // The first subscription fails, as a failed read of the current states would.
+        turnStateChanges: Effect.suspend(() =>
+          ++subscriptions === 1
+            ? Effect.fail(new PluginThreads.PluginThreadsError({ reason: "database busy" }))
+            : Effect.succeed(Stream.fromQueue(changes)),
+        ),
+      });
+
+      yield* useEnvironment(
+        baseDir,
+        Effect.gen(function* () {
+          const manager = yield* PluginPackageManager.PluginPackageManager;
+          yield* manager.rescan;
+          expect(subscriptions).toBe(1);
+          yield* TestClock.adjust(Duration.seconds(1));
+          const change = {
+            threadId: "thread-1",
+            projectId: "project-1",
+            state: "running",
+          } as const;
+          yield* Queue.offer(changes, change);
+          expect(yield* Effect.promise(() => received)).toEqual(change);
+          expect(subscriptions).toBe(2);
+        }),
+        { threads },
+      );
+    }),
+  );
+
+  it.effect("hands each plugin its turn state changes one at a time, in order", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3code-plugin-package-turn-order-test-",
+      });
+      const hookSymbol = `t3.test.plugin.turn-order.${baseDir}`;
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let markDone!: () => void;
+      const done = new Promise<void>((resolve) => {
+        markDone = resolve;
+      });
+      let markStarted!: () => void;
+      const started = new Promise<void>((resolve) => {
+        markStarted = resolve;
+      });
+      const hook = { log: [] as Array<string>, gate, started: markStarted, done: markDone };
+      yield* Effect.acquireRelease(
+        Effect.sync(() => Reflect.set(globalThis, Symbol.for(hookSymbol), hook)),
+        () => Effect.sync(() => Reflect.deleteProperty(globalThis, Symbol.for(hookSymbol))),
+      );
+      const directory = yield* writePackage(
+        baseDir,
+        packageId,
+        commandId,
+        `export default function activate(api) {
+  const hook = globalThis[Symbol.for(${encodeJsonString(hookSymbol)})];
+  api.threads.onTurnStateChange(async (change) => {
+    hook.log.push("start " + change.state);
+    if (change.state === "running") {
+      hook.started();
+      await hook.gate;
+    }
+    hook.log.push("end " + change.state);
+    if (change.state === "completed") hook.done();
+  });
+}
+`,
+      );
+      yield* fileSystem.writeFileString(
+        `${directory}/t3-plugin.json`,
+        threadsManifest(packageId, { activationEvents: ["onTurnStateChange"] }),
+      );
+      yield* fileSystem.writeFileString(
+        `${baseDir}/userdata/plugins.json`,
+        `{"enabled":["${packageId}"]}\n`,
+      );
+      const queued = yield* Deferred.make<void>();
+      const change = (state: PluginThreads.PluginTurnState) =>
+        ({ threadId: "thread-1", projectId: "project-1", state }) as const;
+      const threads = PluginThreads.PluginThreads.of({
+        ...noThreads,
+        // Both changes are handed over before the stream signals, so the gate opens
+        // only once the second change is already waiting behind the first.
+        turnStateChanges: Effect.succeed(
+          Stream.make(change("running"), change("completed")).pipe(
+            Stream.concat(
+              Stream.fromEffect(Deferred.succeed(queued, undefined)).pipe(Stream.drain),
+            ),
+          ),
+        ),
+      });
+
+      yield* useEnvironment(
+        baseDir,
+        Effect.gen(function* () {
+          yield* Deferred.await(queued);
+          yield* Effect.promise(() => started);
+          // The second change waits for the first listener call to settle.
+          expect(hook.log).toEqual(["start running"]);
+          release();
+          yield* Effect.promise(() => done);
+          expect(hook.log).toEqual([
+            "start running",
+            "end running",
+            "start completed",
+            "end completed",
+          ]);
+        }),
+        { threads },
+      );
+    }),
+  );
+
+  it.effect("lets a command read projects and start a thread", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3code-plugin-package-thread-command-test-",
+      });
+      const directory = yield* writePackage(
+        baseDir,
+        packageId,
+        commandId,
+        `export default function activate(api) {
+  api.registerCommand("${commandId}", async () => {
+    const [project] = await api.projects.list();
+    const thread = await api.threads.create({ projectId: project.id, title: "Triage", prompt: "Go" });
+    const stored = await api.threads.get(thread.id);
+    const failure = await api.threads
+      .create({ projectId: "gone", title: "Triage", prompt: "Go" })
+      .catch((error) => error.message);
+    return { message: stored.title + " is " + stored.turnState + "; " + failure, tone: "success" };
+  });
+}
+`,
+      );
+      yield* fileSystem.writeFileString(
+        `${directory}/t3-plugin.json`,
+        encodeManifest({
+          ...manifest,
+          requires: ["t3.commands@0", "t3.threads@0"],
+          contributes: { commands: [{ id: commandId, title: "Start triage" }] },
+        }),
+      );
+      const created: Array<unknown> = [];
+      const thread = {
+        id: "thread-1",
+        projectId: "project-1",
+        title: "Triage",
+        turnState: "running",
+      } as const;
+      const threads = PluginThreads.PluginThreads.of({
+        ...noThreads,
+        listProjects: Effect.succeed([{ id: "project-1", name: "Acme", folder: "/work/acme" }]),
+        createThread: (input) =>
+          (input as { projectId: string }).projectId === "project-1"
+            ? Effect.sync(() => {
+                created.push(input);
+                return thread;
+              })
+            : Effect.fail(
+                new PluginThreads.PluginThreadsError({ reason: "Project gone was not found" }),
+              ),
+        getThread: (id) => Effect.succeed(id === thread.id ? thread : null),
+      });
+
+      yield* useEnvironment(
+        baseDir,
+        Effect.gen(function* () {
+          const manager = yield* PluginPackageManager.PluginPackageManager;
+          const catalog = yield* PluginCommandCatalog.PluginCommandCatalog;
+          yield* manager.enable(packageId);
+          const listed = yield* catalog.list;
+          expect(
+            yield* manager.invokeCommand({ generation: listed.generation, id: commandId }),
+          ).toEqual({
+            message: "Triage is running; Project gone was not found",
+            tone: "success",
+          });
+          expect(created).toEqual([{ projectId: "project-1", title: "Triage", prompt: "Go" }]);
+        }),
+        { threads },
+      );
     }),
   );
 });

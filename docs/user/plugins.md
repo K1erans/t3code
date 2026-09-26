@@ -33,8 +33,10 @@ leftovers will be deleted, and lets you delete them sooner. Sizes are measured o
 
 ## Active and idle
 
-An enabled plugin starts when you run one of its commands and stops again after ten minutes
-without use, so plugins do not run in the background while you are not using them. **Settings → Plugins**
+An enabled plugin starts when you run one of its commands, or, for plugins that ask to, when an
+agent turn starts or ends. It stops again after ten minutes without use, so plugins do not run in
+the background while nothing needs them. A plugin that asks to start with the server keeps running
+instead. **Settings → Plugins**
 shows each one as **Active** or **Idle**; an idle plugin's commands stay in the command palette.
 
 ## Screens

@@ -45,10 +45,17 @@ describe("PluginManifest", () => {
     expect(() => decodeManifest(withoutRequires)).toThrow();
   });
 
-  it("accepts only onStartup as an explicit activation event", () => {
+  it("accepts onStartup and, with thread access, onTurnStateChange as activation events", () => {
+    const withThreads = {
+      ...validManifest,
+      requires: ["t3.threads@0"],
+      activationEvents: ["onTurnStateChange"],
+    };
+    expect(decodeManifest(withThreads)).toEqual(withThreads);
     expect(() =>
       decodeManifest({ ...validManifest, activationEvents: ["onTurnStateChange"] }),
-    ).toThrow();
+    ).toThrow("onTurnStateChange needs t3.threads@0");
+    expect(() => decodeManifest({ ...validManifest, activationEvents: ["onCommand"] })).toThrow();
   });
 
   it("rejects unsupported manifest versions and fields outside the manifest", () => {

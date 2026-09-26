@@ -1064,6 +1064,7 @@ export function createServerEnvironmentAtoms<R, E>(
       label: "environment-data:server:plugin-screen-url",
       tag: WS_METHODS.pluginScreensUrl,
       staleTimeMs: 60 * 60 * 1_000,
+    }),
     pluginData: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:server:plugin-data",
       tag: WS_METHODS.pluginPackagesData,

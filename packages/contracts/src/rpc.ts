@@ -555,6 +555,8 @@ export const WsPluginScreensUrlRpc = Rpc.make(WS_METHODS.pluginScreensUrl, {
   payload: PluginScreenUrlInput,
   success: PluginScreenUrlResult,
   error: Schema.Union([PluginScreenUnavailableError, EnvironmentAuthorizationError]),
+});
+
 export const WsPluginPackagesDataRpc = Rpc.make(WS_METHODS.pluginPackagesData, {
   payload: Schema.Struct({}),
   success: PluginDataSnapshot,
