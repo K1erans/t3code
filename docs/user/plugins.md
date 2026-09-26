@@ -23,8 +23,27 @@ A running server picks up changes without a restart. New plugins appear disabled
 you remove it, it shows as not installed until you install it again. A removed disabled plugin
 simply leaves the list. If a change does not show up, use **Rescan** in Settings → Plugins.
 
+## Plugin data
+
+Data a plugin saves survives disabling, reloading and reinstalling. When you remove a plugin, its
+data is kept for 30 days in case you install it again, then deleted automatically.
+**Settings → Storage → Plugin data** lists every plugin's data on the environment, shows when
+leftovers will be deleted, and lets you delete them sooner. Sizes are measured only when you press
+**Calculate sizes**.
+
 ## Active and idle
 
-An enabled plugin starts when you run one of its commands and stops again after ten minutes
-without use, so plugins do not run in the background while you are not using them. **Settings → Plugins**
+An enabled plugin starts when you run one of its commands, or, for plugins that ask to, when an
+agent turn starts or ends. It stops again after ten minutes without use, so plugins do not run in
+the background while nothing needs them. A plugin that asks to start with the server keeps running
+instead. **Settings → Plugins**
 shows each one as **Active** or **Idle**; an idle plugin's commands stay in the command palette.
+
+## Screens
+
+Some plugins add screens. Open one beside a thread from the **+** menu in the right panel, under
+**Plugins**, or run **Open** followed by the screen's name from the command palette. A screen shows the thread's
+project, and works the same whether you are on this machine or connected remotely.
+
+If a screen's plugin is disabled, fails or is removed, its tab shows why instead, with **Enable** or
+**Reload** where that fixes it. Reinstalling or reloading a plugin refreshes its open screens.

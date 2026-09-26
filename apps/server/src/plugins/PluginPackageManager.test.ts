@@ -2,6 +2,10 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { PluginCommandInvocationError } from "@t3tools/contracts";
 import { it } from "@effect/vitest";
 import { expect } from "vite-plus/test";
+import * as Cause from "effect/Cause";
+import * as Clock from "effect/Clock";
+import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -13,12 +17,14 @@ import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
+import { PluginRuntime } from "@t3tools/plugin-runtime";
 import { PluginManifest } from "@t3tools/plugin-runtime/manifest";
 
 import * as ServerConfig from "../config.ts";
 import * as PluginCommandCatalog from "./PluginCommandCatalog.ts";
 import { installPlugin, removePlugin } from "./PluginInstall.ts";
 import * as PluginPackageManager from "./PluginPackageManager.ts";
+import * as PluginThreads from "./PluginThreads.ts";
 
 const packageId = "com.example.fixture";
 const commandId = "fixture.say-hello";
@@ -41,14 +47,21 @@ const manifest = {
 
 const encodeManifest = Schema.encodeSync(Schema.fromJsonString(PluginManifest));
 const encodeJsonString = Schema.encodeSync(Schema.fromJsonString(Schema.String));
-const decodePluginState = Schema.decodeUnknownSync(
-  Schema.fromJsonString(Schema.Struct({ enabled: Schema.Array(Schema.String) })),
+const PluginStateJson = Schema.fromJsonString(
+  Schema.Struct({
+    enabled: Schema.Array(Schema.String),
+    missingSince: Schema.optional(Schema.Record(Schema.String, Schema.Number)),
+  }),
 );
-const readEnabledIds = (baseDir: string) =>
+const decodePluginState = Schema.decodeUnknownSync(PluginStateJson);
+const encodePluginState = Schema.encodeSync(PluginStateJson);
+const readPluginState = (baseDir: string) =>
   FileSystem.FileSystem.pipe(
     Effect.flatMap((fileSystem) => fileSystem.readFileString(`${baseDir}/userdata/plugins.json`)),
-    Effect.map((contents) => decodePluginState(contents).enabled),
+    Effect.map(decodePluginState),
   );
+const readEnabledIds = (baseDir: string) =>
+  readPluginState(baseDir).pipe(Effect.map((state) => state.enabled));
 /** Runs `effect` while the state directory rejects writes, so persisting enabled state fails. */
 const withReadOnlyStateDir = <A, E, R>(
   fileSystem: FileSystem.FileSystem,
@@ -107,14 +120,46 @@ export default function activate(api) {
 
 interface EnvironmentLayerOptions {
   readonly entryPointTimeout?: Duration.Input;
+  readonly threads?: PluginThreads.PluginThreads["Service"];
+  /** Called as each runtime reconcile starts, with the ids that will stay active. */
+  readonly onReconcile?: (activeIds: ReadonlyArray<string>) => void;
 }
+
+/** Thread access for tests that do not use it: no projects, threads or turn state changes. */
+const noThreads = PluginThreads.PluginThreads.of({
+  listProjects: Effect.succeed([]),
+  getProject: () => Effect.succeed(null),
+  createThread: () => Effect.fail(new PluginThreads.PluginThreadsError({ reason: "no threads" })),
+  getThread: () => Effect.succeed(null),
+  turnStateChanges: Effect.succeed(Stream.never),
+});
 
 const makeEnvironmentLayer = (baseDir: string, options?: EnvironmentLayerOptions) => {
   const configLayer = Layer.fresh(ServerConfig.layerTest(process.cwd(), baseDir));
   const entryPointTimeout = options?.entryPointTimeout;
+  const onReconcile = options?.onReconcile;
+  const catalogLayer =
+    onReconcile === undefined
+      ? PluginCommandCatalog.layer
+      : Layer.effect(
+          PluginCommandCatalog.PluginCommandCatalog,
+          PluginCommandCatalog.make.pipe(
+            Effect.map((catalog) => ({
+              ...catalog,
+              reconcile: (definitions: Parameters<typeof catalog.reconcile>[0]) =>
+                Effect.sync(() => onReconcile(definitions.map((definition) => definition.id))).pipe(
+                  Effect.andThen(catalog.reconcile(definitions)),
+                ),
+            })),
+          ),
+        ).pipe(Layer.provide(PluginRuntime.layer()));
   return PluginPackageManager.layerWith(
     entryPointTimeout === undefined ? {} : { entryPointTimeout },
-  ).pipe(Layer.provideMerge(PluginCommandCatalog.layer), Layer.provideMerge(configLayer));
+  ).pipe(
+    Layer.provideMerge(catalogLayer),
+    Layer.provide(Layer.succeed(PluginThreads.PluginThreads, options?.threads ?? noThreads)),
+    Layer.provideMerge(configLayer),
+  );
 };
 
 const useEnvironment = <A, E>(
@@ -122,7 +167,9 @@ const useEnvironment = <A, E>(
   effect: Effect.Effect<
     A,
     E,
-    PluginPackageManager.PluginPackageManager | PluginCommandCatalog.PluginCommandCatalog
+    | PluginPackageManager.PluginPackageManager
+    | PluginCommandCatalog.PluginCommandCatalog
+    | FileSystem.FileSystem
   >,
   options?: EnvironmentLayerOptions,
 ) => Effect.scoped(effect.pipe(Effect.provide(makeEnvironmentLayer(baseDir, options))));
@@ -494,7 +541,7 @@ export default function activate() {}
 `,
       );
       const reason =
-        "Needs t3.screens@2; this T3 provides t3.commands@0, t3.storage@0. Update T3 or use an older version of the plugin.";
+        "Needs t3.screens@2; this T3 provides t3.commands@0, t3.screens@0, t3.storage@0, t3.threads@0. Update T3 or use an older version of the plugin.";
 
       yield* useEnvironment(
         baseDir,
@@ -517,6 +564,59 @@ export default function activate() {}
       );
 
       expect(yield* fileSystem.exists(activatedFile)).toBe(false);
+    }),
+  );
+
+  it.effect("fails loading a plugin whose screen entry is missing", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3code-plugin-package-screen-entry-test-",
+      });
+      const packageDirectory = yield* writePackage(
+        baseDir,
+        packageId,
+        commandId,
+        "export default function activate() {}\n",
+      );
+      yield* fileSystem.writeFileString(
+        `${packageDirectory}/t3-plugin.json`,
+        encodeManifest({
+          ...manifest,
+          requires: ["t3.screens@0"],
+          contributes: {
+            screens: [
+              {
+                id: "board",
+                title: "Board",
+                entry: "./dist/index.html",
+                placement: "panel",
+                scope: "project",
+              },
+            ],
+          },
+        }),
+      );
+
+      yield* useEnvironment(
+        baseDir,
+        Effect.gen(function* () {
+          const manager = yield* PluginPackageManager.PluginPackageManager;
+          const catalog = yield* PluginCommandCatalog.PluginCommandCatalog;
+          const failure = yield* Effect.flip(manager.enable(packageId));
+          expect(failure.message).toContain("screen board entry ./dist/index.html does not exist");
+          expect((yield* catalog.list).screens).toEqual([]);
+          expect(yield* manager.screen(packageId, "board")).toBeUndefined();
+          // A folder with the entry's name is not an entry file either.
+          yield* fileSystem.makeDirectory(`${packageDirectory}/dist/index.html`, {
+            recursive: true,
+          });
+          const folderFailure = yield* Effect.flip(manager.enable(packageId));
+          expect(folderFailure.message).toContain(
+            "screen board entry ./dist/index.html does not exist",
+          );
+        }),
+      );
     }),
   );
 
@@ -569,6 +669,277 @@ export default function activate() {}
       expect(yield* useEnvironment(baseDir, afterStartup)).toBe("Invoked 5 times.");
       expect(yield* fileSystem.exists(`${dataDirectory}/storage.sqlite`)).toBe(true);
       expect(yield* fileSystem.exists(`${baseDir}/userdata/state.sqlite`)).toBe(false);
+    }),
+  );
+
+  it.effect("starts a data countdown when a plugin is removed and clears it on reinstall", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3code-plugin-data-countdown-test-",
+      });
+      const packageDirectory = `${baseDir}/userdata/plugins/${packageId}`;
+      const install = Effect.gen(function* () {
+        yield* fileSystem.makeDirectory(packageDirectory, { recursive: true });
+        yield* fileSystem.writeFileString(
+          `${packageDirectory}/t3-plugin.json`,
+          encodeManifest(manifest),
+        );
+        yield* fileSystem.writeFileString(
+          `${packageDirectory}/index.mjs`,
+          pluginSource(`${baseDir}/disposed.log`),
+        );
+      });
+      yield* install;
+      yield* TestClock.setTime(Duration.toMillis(Duration.days(100)));
+
+      yield* useEnvironment(
+        baseDir,
+        Effect.gen(function* () {
+          const manager = yield* PluginPackageManager.PluginPackageManager;
+          const catalog = yield* PluginCommandCatalog.PluginCommandCatalog;
+          const count = catalog.list.pipe(
+            Effect.flatMap((listed) =>
+              manager.invokeCommand({ generation: listed.generation, id: countCommandId }),
+            ),
+            Effect.map((result) => result.message),
+          );
+          yield* manager.enable(packageId);
+          expect(yield* count).toBe("Invoked 1 times.");
+          expect(yield* manager.data).toEqual({
+            entries: [{ id: packageId, name: "Fixture", installed: true }],
+          });
+
+          const removedAt = yield* Clock.currentTimeMillis;
+          yield* fileSystem.remove(packageDirectory, { recursive: true });
+          yield* manager.rescan;
+          expect((yield* readPluginState(baseDir)).missingSince).toEqual({
+            [packageId]: removedAt,
+          });
+          expect(yield* manager.data).toEqual({
+            entries: [
+              {
+                id: packageId,
+                installed: false,
+                deletesAt: DateTime.formatIso(
+                  DateTime.makeUnsafe(
+                    removedAt + Duration.toMillis(PluginPackageManager.PLUGIN_DATA_RETENTION),
+                  ),
+                ),
+              },
+            ],
+          });
+
+          // A later rescan keeps the original start rather than restarting the countdown.
+          yield* TestClock.setTime(removedAt + Duration.toMillis(Duration.days(1)));
+          yield* manager.rescan;
+          expect((yield* readPluginState(baseDir)).missingSince).toEqual({
+            [packageId]: removedAt,
+          });
+
+          yield* install;
+          yield* manager.rescan;
+          expect((yield* readPluginState(baseDir)).missingSince).toBeUndefined();
+          expect((yield* manager.data).entries).toEqual([
+            { id: packageId, name: "Fixture", installed: true },
+          ]);
+          expect(yield* count).toBe("Invoked 2 times.");
+        }),
+      );
+    }),
+  );
+
+  it.effect("deletes leftover data once its countdown has run out", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3code-plugin-data-expiry-test-",
+      });
+      const now = Duration.toMillis(Duration.days(100));
+      const retention = Duration.toMillis(PluginPackageManager.PLUGIN_DATA_RETENTION);
+      yield* TestClock.setTime(now);
+      for (const id of [
+        "com.acme.expired",
+        "com.acme.recent",
+        "com.acme.broken",
+        "com.acme.bare",
+      ]) {
+        yield* fileSystem.makeDirectory(`${baseDir}/userdata/plugin-data/${id}`, {
+          recursive: true,
+        });
+      }
+      // A plain file named after an id is not a plugin, so it protects nothing.
+      yield* fileSystem.makeDirectory(`${baseDir}/userdata/plugins`, { recursive: true });
+      yield* fileSystem.writeFileString(`${baseDir}/userdata/plugins/com.acme.expired`, "");
+      // A plugin whose manifest is unreadable or missing is still installed, so its data stays.
+      yield* fileSystem.makeDirectory(`${baseDir}/userdata/plugins/com.acme.bare`, {
+        recursive: true,
+      });
+      yield* fileSystem.makeDirectory(`${baseDir}/userdata/plugins/com.acme.broken`, {
+        recursive: true,
+      });
+      yield* fileSystem.writeFileString(
+        `${baseDir}/userdata/plugins/com.acme.broken/t3-plugin.json`,
+        "{ not json",
+      );
+      yield* fileSystem.writeFileString(
+        `${baseDir}/userdata/plugins.json`,
+        encodePluginState({
+          enabled: [],
+          missingSince: {
+            "com.acme.expired": now - retention,
+            "com.acme.recent": now - retention + 1,
+            "com.acme.gone": now - 1,
+            "com.acme.broken": now - retention,
+            "com.acme.bare": now - retention,
+          },
+        }),
+      );
+
+      yield* useEnvironment(
+        baseDir,
+        PluginPackageManager.PluginPackageManager.pipe(Effect.flatMap((manager) => manager.rescan)),
+      );
+
+      expect(yield* fileSystem.exists(`${baseDir}/userdata/plugin-data/com.acme.expired`)).toBe(
+        false,
+      );
+      expect(yield* fileSystem.exists(`${baseDir}/userdata/plugin-data/com.acme.recent`)).toBe(
+        true,
+      );
+      for (const id of ["com.acme.broken", "com.acme.bare"]) {
+        expect(yield* fileSystem.exists(`${baseDir}/userdata/plugin-data/${id}`)).toBe(true);
+      }
+      // Entries whose folder is gone or whose plugin is back are dropped along with the expired one.
+      expect((yield* readPluginState(baseDir)).missingSince).toEqual({
+        "com.acme.recent": now - retention + 1,
+      });
+    }),
+  );
+
+  it.effect("measures plugin data on request and deletes only leftovers", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3code-plugin-data-delete-test-",
+      });
+      yield* writePackage(baseDir, packageId, commandId, "export default () => {};\n");
+      const leftover = `${baseDir}/userdata/plugin-data/com.acme.leftover`;
+      yield* fileSystem.makeDirectory(`${leftover}/nested`, { recursive: true });
+      yield* fileSystem.writeFileString(`${leftover}/nested/notes.txt`, "hello");
+      yield* fileSystem.makeDirectory(`${baseDir}/userdata/plugin-data/${packageId}`);
+
+      yield* useEnvironment(
+        baseDir,
+        Effect.gen(function* () {
+          const manager = yield* PluginPackageManager.PluginPackageManager;
+          yield* manager.rescan;
+          expect((yield* manager.data).entries.map((entry) => entry.sizeBytes)).toEqual([
+            undefined,
+            undefined,
+          ]);
+          expect(yield* manager.dataSizes).toMatchObject({
+            entries: [
+              { id: "com.acme.leftover", installed: false, sizeBytes: 5 },
+              { id: packageId, installed: true, sizeBytes: 0 },
+            ],
+          });
+
+          const installed = yield* Effect.exit(manager.deleteData(packageId));
+          expect(installed._tag).toBe("Failure");
+          expect(yield* fileSystem.exists(`${baseDir}/userdata/plugin-data/${packageId}`)).toBe(
+            true,
+          );
+
+          expect((yield* manager.deleteData("com.acme.leftover")).entries).toMatchObject([
+            { id: packageId },
+          ]);
+          expect(yield* fileSystem.exists(leftover)).toBe(false);
+          expect((yield* readPluginState(baseDir)).missingSince).toBeUndefined();
+          const again = yield* Effect.exit(manager.deleteData("com.acme.leftover"));
+          expect(again._tag === "Failure" && Cause.squash(again.cause)).toMatchObject({
+            _tag: "PluginPackageNotFoundError",
+          });
+        }),
+      );
+    }),
+  );
+
+  it.effect("deletes a removed plugin's data only after its running command finishes", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3code-plugin-data-running-test-",
+      });
+      const gateSymbol = `t3.test.plugin.data-running.${baseDir}`;
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let markStarted!: () => void;
+      const commandStarted = new Promise<void>((resolve) => {
+        markStarted = resolve;
+      });
+      let markRetiring!: () => void;
+      const retiring = new Promise<void>((resolve) => {
+        markRetiring = resolve;
+      });
+      yield* Effect.acquireRelease(
+        Effect.sync(() =>
+          Reflect.set(globalThis, Symbol.for(gateSymbol), { started: markStarted, released }),
+        ),
+        () => Effect.sync(() => Reflect.deleteProperty(globalThis, Symbol.for(gateSymbol))),
+      );
+      const packageDirectory = yield* writePackage(
+        baseDir,
+        packageId,
+        commandId,
+        `export default function activate(api) {
+  api.registerCommand("${commandId}", async () => {
+    const gate = globalThis[Symbol.for(${encodeJsonString(gateSymbol)})];
+    gate.started();
+    await gate.released;
+    await api.storage.set("last", "written after removal");
+    return { message: "stored", tone: "success" };
+  });
+}
+`,
+      );
+
+      yield* useEnvironment(
+        baseDir,
+        Effect.gen(function* () {
+          const manager = yield* PluginPackageManager.PluginPackageManager;
+          const catalog = yield* PluginCommandCatalog.PluginCommandCatalog;
+          yield* manager.enable(packageId);
+          const listed = yield* catalog.list;
+          const invoked = yield* Effect.forkChild(
+            manager.invokeCommand({ generation: listed.generation, id: commandId }),
+          );
+          yield* Effect.promise(() => commandStarted);
+
+          // The rescan retiring the removed plugin holds the lock until the command
+          // finishes, so the delete queued behind it never closes a store in use.
+          yield* fileSystem.remove(packageDirectory, { recursive: true });
+          const rescanned = yield* Effect.forkChild(manager.rescan);
+          // The rescan has retired the plugin and now waits for its command.
+          yield* Effect.promise(() => retiring);
+          const deleted = yield* Effect.forkChild(manager.deleteData(packageId));
+          release();
+
+          expect(yield* Fiber.join(invoked)).toEqual({ message: "stored", tone: "success" });
+          yield* Fiber.join(rescanned);
+          expect((yield* Fiber.join(deleted)).entries).toEqual([]);
+          expect(yield* fileSystem.exists(`${baseDir}/userdata/plugin-data/${packageId}`)).toBe(
+            false,
+          );
+        }),
+        {
+          onReconcile: (activeIds) => {
+            if (!activeIds.includes(packageId)) markRetiring();
+          },
+        },
+      );
     }),
   );
 
@@ -1920,6 +2291,321 @@ export default async function activate(api) {
       expect(yield* Queue.size(subscriptions)).toBe(0);
       yield* TestClock.adjust("1 millis");
       expect(yield* Queue.take(subscriptions)).toBe(6);
+    }),
+  );
+});
+
+const threadsManifest = (id: string, extra: Record<string, unknown>) => {
+  const { contributes: _contributes, ...base } = manifest;
+  return encodeManifest({ ...base, id, requires: ["t3.threads@0"], ...extra });
+};
+
+it.layer(NodeServices.layer)("plugin thread access", (it) => {
+  it.effect("wakes onTurnStateChange plugins with the change that triggered them", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3code-plugin-package-turn-state-test-",
+      });
+      const changes = yield* Queue.unbounded<PluginThreads.PluginTurnStateChange>();
+      const hookSymbol = `t3.test.plugin.turn-state.${baseDir}`;
+      let markReceived!: (change: unknown) => void;
+      const received = new Promise<unknown>((resolve) => {
+        markReceived = resolve;
+      });
+      const hook = { activations: { waker: 0, sleeper: 0 }, received: markReceived };
+      yield* Effect.acquireRelease(
+        Effect.sync(() => Reflect.set(globalThis, Symbol.for(hookSymbol), hook)),
+        () => Effect.sync(() => Reflect.deleteProperty(globalThis, Symbol.for(hookSymbol))),
+      );
+      const listenerSource = (name: string) => `
+export default function activate(api) {
+  const hook = globalThis[Symbol.for(${encodeJsonString(hookSymbol)})];
+  hook.activations.${name} += 1;
+  api.threads.onTurnStateChange((change) => hook.received({ name: "${name}", change }));
+}
+`;
+      const packages = [
+        {
+          id: "com.example.waker",
+          name: "waker",
+          extra: { activationEvents: ["onTurnStateChange"] },
+        },
+        { id: "com.example.sleeper", name: "sleeper", extra: {} },
+      ];
+      for (const plugin of packages) {
+        const directory = yield* writePackage(
+          baseDir,
+          plugin.id,
+          commandId,
+          listenerSource(plugin.name),
+        );
+        yield* fileSystem.writeFileString(
+          `${directory}/t3-plugin.json`,
+          threadsManifest(plugin.id, plugin.extra),
+        );
+      }
+      yield* fileSystem.writeFileString(
+        `${baseDir}/userdata/plugins.json`,
+        `{"enabled":["com.example.sleeper","com.example.waker"]}\n`,
+      );
+      const threads = PluginThreads.PluginThreads.of({
+        ...noThreads,
+        turnStateChanges: Effect.succeed(Stream.fromQueue(changes)),
+      });
+
+      yield* useEnvironment(
+        baseDir,
+        Effect.gen(function* () {
+          const manager = yield* PluginPackageManager.PluginPackageManager;
+          expect(yield* manager.rescan).toMatchObject({
+            packages: [{ state: "idle" }, { state: "idle" }],
+          });
+          expect(hook.activations).toEqual({ waker: 0, sleeper: 0 });
+
+          const change = {
+            threadId: "thread-1",
+            projectId: "project-1",
+            state: "running",
+          } as const;
+          yield* Queue.offer(changes, change);
+          expect(yield* Effect.promise(() => received)).toEqual({ name: "waker", change });
+          // Only the plugin that asked to wake on turn state changes activated.
+          expect(hook.activations).toEqual({ waker: 1, sleeper: 0 });
+          expect(yield* manager.status).toMatchObject({
+            packages: [
+              { id: "com.example.sleeper", state: "idle" },
+              { id: "com.example.waker", state: "active" },
+            ],
+          });
+        }),
+        { threads },
+      );
+    }),
+  );
+
+  it.effect("keeps following turn state changes after the watch fails to start", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3code-plugin-package-turn-watch-retry-test-",
+      });
+      const changes = yield* Queue.unbounded<PluginThreads.PluginTurnStateChange>();
+      const hookSymbol = `t3.test.plugin.turn-watch-retry.${baseDir}`;
+      let markReceived!: (change: unknown) => void;
+      const received = new Promise<unknown>((resolve) => {
+        markReceived = resolve;
+      });
+      yield* Effect.acquireRelease(
+        Effect.sync(() => Reflect.set(globalThis, Symbol.for(hookSymbol), markReceived)),
+        () => Effect.sync(() => Reflect.deleteProperty(globalThis, Symbol.for(hookSymbol))),
+      );
+      const directory = yield* writePackage(
+        baseDir,
+        packageId,
+        commandId,
+        `export default function activate(api) {
+  api.threads.onTurnStateChange(globalThis[Symbol.for(${encodeJsonString(hookSymbol)})]);
+}
+`,
+      );
+      yield* fileSystem.writeFileString(
+        `${directory}/t3-plugin.json`,
+        threadsManifest(packageId, { activationEvents: ["onTurnStateChange"] }),
+      );
+      yield* fileSystem.writeFileString(
+        `${baseDir}/userdata/plugins.json`,
+        `{"enabled":["${packageId}"]}\n`,
+      );
+      let subscriptions = 0;
+      const threads = PluginThreads.PluginThreads.of({
+        ...noThreads,
+        // The first subscription fails, as a failed read of the current states would.
+        turnStateChanges: Effect.suspend(() =>
+          ++subscriptions === 1
+            ? Effect.fail(new PluginThreads.PluginThreadsError({ reason: "database busy" }))
+            : Effect.succeed(Stream.fromQueue(changes)),
+        ),
+      });
+
+      yield* useEnvironment(
+        baseDir,
+        Effect.gen(function* () {
+          const manager = yield* PluginPackageManager.PluginPackageManager;
+          yield* manager.rescan;
+          expect(subscriptions).toBe(1);
+          yield* TestClock.adjust(Duration.seconds(1));
+          const change = {
+            threadId: "thread-1",
+            projectId: "project-1",
+            state: "running",
+          } as const;
+          yield* Queue.offer(changes, change);
+          expect(yield* Effect.promise(() => received)).toEqual(change);
+          expect(subscriptions).toBe(2);
+        }),
+        { threads },
+      );
+    }),
+  );
+
+  it.effect("hands each plugin its turn state changes one at a time, in order", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3code-plugin-package-turn-order-test-",
+      });
+      const hookSymbol = `t3.test.plugin.turn-order.${baseDir}`;
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let markDone!: () => void;
+      const done = new Promise<void>((resolve) => {
+        markDone = resolve;
+      });
+      let markStarted!: () => void;
+      const started = new Promise<void>((resolve) => {
+        markStarted = resolve;
+      });
+      const hook = { log: [] as Array<string>, gate, started: markStarted, done: markDone };
+      yield* Effect.acquireRelease(
+        Effect.sync(() => Reflect.set(globalThis, Symbol.for(hookSymbol), hook)),
+        () => Effect.sync(() => Reflect.deleteProperty(globalThis, Symbol.for(hookSymbol))),
+      );
+      const directory = yield* writePackage(
+        baseDir,
+        packageId,
+        commandId,
+        `export default function activate(api) {
+  const hook = globalThis[Symbol.for(${encodeJsonString(hookSymbol)})];
+  api.threads.onTurnStateChange(async (change) => {
+    hook.log.push("start " + change.state);
+    if (change.state === "running") {
+      hook.started();
+      await hook.gate;
+    }
+    hook.log.push("end " + change.state);
+    if (change.state === "completed") hook.done();
+  });
+}
+`,
+      );
+      yield* fileSystem.writeFileString(
+        `${directory}/t3-plugin.json`,
+        threadsManifest(packageId, { activationEvents: ["onTurnStateChange"] }),
+      );
+      yield* fileSystem.writeFileString(
+        `${baseDir}/userdata/plugins.json`,
+        `{"enabled":["${packageId}"]}\n`,
+      );
+      const queued = yield* Deferred.make<void>();
+      const change = (state: PluginThreads.PluginTurnState) =>
+        ({ threadId: "thread-1", projectId: "project-1", state }) as const;
+      const threads = PluginThreads.PluginThreads.of({
+        ...noThreads,
+        // Both changes are handed over before the stream signals, so the gate opens
+        // only once the second change is already waiting behind the first.
+        turnStateChanges: Effect.succeed(
+          Stream.make(change("running"), change("completed")).pipe(
+            Stream.concat(
+              Stream.fromEffect(Deferred.succeed(queued, undefined)).pipe(Stream.drain),
+            ),
+          ),
+        ),
+      });
+
+      yield* useEnvironment(
+        baseDir,
+        Effect.gen(function* () {
+          yield* Deferred.await(queued);
+          yield* Effect.promise(() => started);
+          // The second change waits for the first listener call to settle.
+          expect(hook.log).toEqual(["start running"]);
+          release();
+          yield* Effect.promise(() => done);
+          expect(hook.log).toEqual([
+            "start running",
+            "end running",
+            "start completed",
+            "end completed",
+          ]);
+        }),
+        { threads },
+      );
+    }),
+  );
+
+  it.effect("lets a command read projects and start a thread", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3code-plugin-package-thread-command-test-",
+      });
+      const directory = yield* writePackage(
+        baseDir,
+        packageId,
+        commandId,
+        `export default function activate(api) {
+  api.registerCommand("${commandId}", async () => {
+    const [project] = await api.projects.list();
+    const thread = await api.threads.create({ projectId: project.id, title: "Triage", prompt: "Go" });
+    const stored = await api.threads.get(thread.id);
+    const failure = await api.threads
+      .create({ projectId: "gone", title: "Triage", prompt: "Go" })
+      .catch((error) => error.message);
+    return { message: stored.title + " is " + stored.turnState + "; " + failure, tone: "success" };
+  });
+}
+`,
+      );
+      yield* fileSystem.writeFileString(
+        `${directory}/t3-plugin.json`,
+        encodeManifest({
+          ...manifest,
+          requires: ["t3.commands@0", "t3.threads@0"],
+          contributes: { commands: [{ id: commandId, title: "Start triage" }] },
+        }),
+      );
+      const created: Array<unknown> = [];
+      const thread = {
+        id: "thread-1",
+        projectId: "project-1",
+        title: "Triage",
+        turnState: "running",
+      } as const;
+      const threads = PluginThreads.PluginThreads.of({
+        ...noThreads,
+        listProjects: Effect.succeed([{ id: "project-1", name: "Acme", folder: "/work/acme" }]),
+        createThread: (input) =>
+          (input as { projectId: string }).projectId === "project-1"
+            ? Effect.sync(() => {
+                created.push(input);
+                return thread;
+              })
+            : Effect.fail(
+                new PluginThreads.PluginThreadsError({ reason: "Project gone was not found" }),
+              ),
+        getThread: (id) => Effect.succeed(id === thread.id ? thread : null),
+      });
+
+      yield* useEnvironment(
+        baseDir,
+        Effect.gen(function* () {
+          const manager = yield* PluginPackageManager.PluginPackageManager;
+          const catalog = yield* PluginCommandCatalog.PluginCommandCatalog;
+          yield* manager.enable(packageId);
+          const listed = yield* catalog.list;
+          expect(
+            yield* manager.invokeCommand({ generation: listed.generation, id: commandId }),
+          ).toEqual({
+            message: "Triage is running; Project gone was not found",
+            tone: "success",
+          });
+          expect(created).toEqual([{ projectId: "project-1", title: "Triage", prompt: "Go" }]);
+        }),
+        { threads },
+      );
     }),
   );
 });

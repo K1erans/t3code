@@ -1058,6 +1058,18 @@ export function createServerEnvironmentAtoms<R, E>(
       tag: WS_METHODS.pluginPackagesStatus,
       staleTimeMs: 1_000,
     }),
+    // Keyed by revision, so a reload mints a new URL. Reusing one URL while its token is
+    // valid lets a reopened screen load from the browser cache.
+    pluginScreenUrl: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:server:plugin-screen-url",
+      tag: WS_METHODS.pluginScreensUrl,
+      staleTimeMs: 60 * 60 * 1_000,
+    }),
+    pluginData: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:server:plugin-data",
+      tag: WS_METHODS.pluginPackagesData,
+      staleTimeMs: 1_000,
+    }),
     resourceTelemetryHistory: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:server:resource-telemetry-history",
       tag: WS_METHODS.serverGetResourceTelemetryHistory,
@@ -1125,6 +1137,21 @@ export function createServerEnvironmentAtoms<R, E>(
     rescanPluginPackages: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:server:rescan-plugin-packages",
       tag: WS_METHODS.pluginPackagesRescan,
+      scheduler: pluginPackageScheduler,
+      concurrency: configConcurrency,
+    }),
+    // Measuring walks every file, so sizes are a command the user runs, never a query.
+    calculatePluginDataSizes: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:calculate-plugin-data-sizes",
+      tag: WS_METHODS.pluginPackagesDataSizes,
+      concurrency: {
+        mode: "singleFlight",
+        key: ({ environmentId }) => environmentId,
+      },
+    }),
+    deletePluginData: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:delete-plugin-data",
+      tag: WS_METHODS.pluginPackagesDeleteData,
       scheduler: pluginPackageScheduler,
       concurrency: configConcurrency,
     }),

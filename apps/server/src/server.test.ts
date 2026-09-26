@@ -5893,6 +5893,134 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect("serves an enabled plugin's screen from a sandboxed signed URL", () =>
+    Effect.gen(function* () {
+      const config = yield* buildAppUnderTest();
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const pluginId = "com.example.screens";
+      const screenDirectory = path.join(config.stateDir, "plugins", pluginId, "dist", "screen");
+      yield* fileSystem.makeDirectory(screenDirectory, { recursive: true });
+      yield* fileSystem.writeFileString(
+        path.join(config.stateDir, "plugins", pluginId, "t3-plugin.json"),
+        `{
+  "manifestVersion": 1,
+  "id": "${pluginId}",
+  "name": "Screens",
+  "version": "1.0.0",
+  "requires": ["t3.screens@0"],
+  "entrypoints": { "server": "./server.mjs" },
+  "contributes": {
+    "screens": [
+      {
+        "id": "board",
+        "title": "Board",
+        "entry": "./dist/screen/index.html",
+        "placement": "panel",
+        "scope": "project"
+      }
+    ]
+  }
+}`,
+      );
+      yield* fileSystem.writeFileString(
+        path.join(config.stateDir, "plugins", pluginId, "server.mjs"),
+        "export default function activate() {}\n",
+      );
+      yield* fileSystem.writeFileString(
+        path.join(config.stateDir, "plugins", pluginId, "secret.js"),
+        "outside the screen folder",
+      );
+      yield* fileSystem.writeFileString(path.join(screenDirectory, "index.html"), "<p>board</p>");
+      yield* fileSystem.writeFileString(path.join(screenDirectory, "app.js"), "export {};");
+      const wsUrl = yield* getWsServerUrl("/ws");
+
+      yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          Effect.gen(function* () {
+            yield* client[WS_METHODS.pluginPackagesEnable]({ id: pluginId });
+            const listed = yield* client[WS_METHODS.pluginCommandsList]({});
+            assert.deepEqual(listed.screens, [
+              {
+                pluginId,
+                id: "board",
+                title: "Board",
+                placement: "panel",
+                scope: "project",
+                surfaces: ["web", "desktop"],
+                revision: listed.screens[0]!.revision,
+              },
+            ]);
+            const revision = listed.screens[0]!.revision;
+            const issued = yield* client[WS_METHODS.pluginScreensUrl]({
+              pluginId,
+              screenId: "board",
+              revision,
+            });
+            assert.match(issued.relativeUrl, /^\/api\/plugins\/[^/]+\/index\.html$/);
+            const base = issued.relativeUrl.slice(0, -"index.html".length);
+
+            const entry = yield* HttpClient.get(issued.relativeUrl, {
+              headers: { origin: "null" },
+            });
+            assert.equal(entry.status, 200);
+            assert.equal(yield* entry.text, "<p>board</p>");
+            assert.equal(entry.headers["content-type"], "text/html; charset=utf-8");
+            assert.match(
+              entry.headers["content-security-policy"] ?? "",
+              /^sandbox allow-scripts allow-forms allow-modals allow-popups; /,
+            );
+            assert.notInclude(entry.headers["content-security-policy"] ?? "", "allow-same-origin");
+            assert.include(
+              entry.headers["content-security-policy"] ?? "",
+              "script-src 'self' 'wasm-unsafe-eval'",
+            );
+            assert.equal(entry.headers["referrer-policy"], "no-referrer");
+            assert.equal(entry.headers["access-control-allow-origin"], "*");
+
+            const runtime = yield* HttpClient.get(`${base}_t3/screen.js`);
+            assert.equal(runtime.status, 200);
+            assert.equal(runtime.headers["content-type"], "text/javascript; charset=utf-8");
+            assert.include(yield* runtime.text, "This screen must run inside T3 Code");
+            assert.equal((yield* HttpClient.get(`${base}app.js`)).status, 200);
+            for (const escape of [
+              "..%2Fsecret.js",
+              "x%2F..%2F..%2F..%2Fsecret.js",
+              ".hidden.js",
+              "missing.js",
+            ]) {
+              assert.equal((yield* HttpClient.get(`${base}${escape}`)).status, 404);
+            }
+
+            // A stale revision cannot be minted, and a reload revokes the old URL.
+            const stale = yield* Effect.flip(
+              client[WS_METHODS.pluginScreensUrl]({
+                pluginId,
+                screenId: "board",
+                revision: revision + 100,
+              }),
+            );
+            assert.equal(stale._tag, "PluginScreenUnavailableError");
+            yield* client[WS_METHODS.pluginPackagesReload]({ id: pluginId });
+            assert.equal((yield* HttpClient.get(issued.relativeUrl)).status, 404);
+            const reloaded = yield* client[WS_METHODS.pluginCommandsList]({});
+            assert.notEqual(reloaded.screens[0]?.revision, revision);
+            const fresh = yield* client[WS_METHODS.pluginScreensUrl]({
+              pluginId,
+              screenId: "board",
+              revision: reloaded.screens[0]!.revision,
+            });
+            assert.equal((yield* HttpClient.get(fresh.relativeUrl)).status, 200);
+
+            yield* client[WS_METHODS.pluginPackagesDisable]({ id: pluginId });
+            assert.equal((yield* HttpClient.get(fresh.relativeUrl)).status, 404);
+            assert.deepEqual((yield* client[WS_METHODS.pluginCommandsList]({})).screens, []);
+          }),
+        ),
+      );
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect("serves draft workspace files without a thread", () =>
     Effect.gen(function* () {
       yield* buildAppUnderTest();
@@ -6509,7 +6637,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       );
 
       // No plugins are installed, so there are no commands.
-      assert.deepEqual(result.listed, { commands: [], generation: 0 });
+      assert.deepEqual(result.listed, { commands: [], screens: [], generation: 0 });
       assert.deepEqual(result.streamed, result.listed);
       assert.deepInclude(result.missing, {
         _tag: "PluginCommandNotFoundError",

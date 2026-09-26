@@ -1,6 +1,7 @@
 import * as Schema from "effect/Schema";
 
 import { NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { PluginPackageId } from "./pluginPackages.ts";
 
 export const PluginCommandId = TrimmedNonEmptyString.check(Schema.isMaxLength(200));
 export type PluginCommandId = typeof PluginCommandId.Type;
@@ -16,9 +17,33 @@ export const PluginCommand = Schema.Struct({
 });
 export type PluginCommand = typeof PluginCommand.Type;
 
+export const PluginScreenId = Schema.String.check(
+  Schema.isPattern(/^[a-z0-9][a-z0-9-]*$/),
+  Schema.isMaxLength(64),
+);
+export type PluginScreenId = typeof PluginScreenId.Type;
+
+/**
+ * A screen an enabled plugin declares. `revision` changes whenever the plugin's code is
+ * reloaded, so clients rebuild open frames from a fresh URL.
+ */
+export const PluginScreen = Schema.Struct({
+  pluginId: PluginPackageId,
+  id: PluginScreenId,
+  title: TrimmedNonEmptyString.check(Schema.isMaxLength(80)),
+  placement: Schema.Literal("panel"),
+  /** A project screen needs a current project; an environment screen does not. */
+  scope: Schema.Literals(["project", "environment"]),
+  surfaces: Schema.Array(PluginCommandSurface).check(Schema.isMinLength(1)),
+  revision: NonNegativeInt,
+});
+export type PluginScreen = typeof PluginScreen.Type;
+
+/** What the palette offers: commands to run and screens to open, from every enabled plugin. */
 export const PluginCommandCatalog = Schema.Struct({
   generation: NonNegativeInt,
   commands: Schema.Array(PluginCommand),
+  screens: Schema.Array(PluginScreen),
 });
 export type PluginCommandCatalog = typeof PluginCommandCatalog.Type;
 

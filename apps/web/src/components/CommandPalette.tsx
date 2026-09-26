@@ -123,6 +123,7 @@ import {
   useRightPanelStore,
 } from "../rightPanelStore";
 import { getLatestThreadForProject, sortThreads } from "../lib/threadSort";
+import { currentPluginSurface, openablePanelScreens } from "./plugins/pluginScreens.logic";
 import {
   cn,
   getLocalFileManagerName,
@@ -146,6 +147,7 @@ import {
   buildCommandPaletteProjectMetadata,
   buildProjectActionItems,
   buildPluginCommandActionItems,
+  buildPluginScreenActionItems,
   buildRootGroups,
   buildThreadActionItems,
   buildLinkedThreadActionItems,
@@ -207,7 +209,11 @@ import { PullRequestGlyph } from "~/components/pullRequest/pullRequestIcons";
 import { readPullRequestListPreferences } from "~/components/pullRequest/pullRequestListPreferences";
 
 const EMPTY_BROWSE_ENTRIES: FilesystemBrowseResult["entries"] = [];
-const EMPTY_PLUGIN_COMMAND_CATALOG: PluginCommandCatalog = { commands: [], generation: 0 };
+const EMPTY_PLUGIN_COMMAND_CATALOG: PluginCommandCatalog = {
+  commands: [],
+  screens: [],
+  generation: 0,
+};
 const EMPTY_PLUGIN_COMMAND_CATALOG_ATOM = Atom.make(
   AsyncResult.success(EMPTY_PLUGIN_COMMAND_CATALOG),
 ).pipe(Atom.withLabel("plugin-commands:empty"));
@@ -2117,14 +2123,39 @@ function OpenCommandPaletteDialog(props: {
     });
   }
 
+  // Panel screens open beside the active thread or draft, from that thread's environment,
+  // which is also the catalog's environment whenever there is one.
+  const pluginScreenThreadRef = activeThread
+    ? scopeThreadRef(activeThread.environmentId, activeThread.id)
+    : activeDraftThread
+      ? scopeThreadRef(activeDraftThread.environmentId, activeDraftThread.threadId)
+      : null;
+  if (pluginScreenThreadRef) {
+    const threadRef = pluginScreenThreadRef;
+    actionItems.push(
+      ...buildPluginScreenActionItems({
+        screens: openablePanelScreens(pluginCommandCatalog.screens, {
+          surface: currentPluginSurface(),
+          projectAvailable: (activeThread?.projectId ?? activeDraftThread?.projectId) != null,
+        }),
+        icon: <PuzzleIcon className={ITEM_ICON_CLASS} />,
+        open: (screen) =>
+          useRightPanelStore.getState().openPluginScreen(threadRef, {
+            pluginId: screen.pluginId,
+            screenId: screen.id,
+            title: screen.title,
+          }),
+      }),
+    );
+  }
+
   if (pluginCommandEnvironmentId !== null) {
     const commandEnvironmentId = pluginCommandEnvironmentId;
     actionItems.push(
       ...buildPluginCommandActionItems({
         commands: pluginCommandCatalog.commands,
         icon: <PuzzleIcon className={ITEM_ICON_CLASS} />,
-        surface:
-          typeof window !== "undefined" && window.desktopBridge !== undefined ? "desktop" : "web",
+        surface: currentPluginSurface(),
         run: async (command: PluginCommand) => {
           const result = await invokePluginCommand({
             environmentId: commandEnvironmentId,
