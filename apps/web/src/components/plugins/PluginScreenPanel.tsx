@@ -116,14 +116,13 @@ function PluginScreenFrame(props: {
   const { projectId } = props;
 
   useEffect(() => {
-    // The theme the frame last received, or null until its runtime says hello. A page
-    // navigating inside the frame says hello again and is sent everything afresh.
+    // The theme the frame last received, or null until it was first sent. A page navigating
+    // inside the frame is sent everything afresh.
     let lastSent: ScreenTheme | null = null;
-    const onMessage = (event: MessageEvent) => {
+    const sendInit = () => {
       const element = frameRef.current;
       const frame = element?.contentWindow;
-      if (element == null || frame == null || event.source !== frame) return;
-      if (typeof event.data !== "object" || event.data?.type !== "t3-screen:hello") return;
+      if (element == null || frame == null) return;
       lastSent = readScreenTheme(element);
       frame.postMessage(
         {
@@ -133,6 +132,17 @@ function PluginScreenFrame(props: {
         },
         "*",
       );
+    };
+    // The runtime greets the host when it loads, or when the SDK loads it later.
+    const onMessage = (event: MessageEvent) => {
+      if (event.source == null || event.source !== frameRef.current?.contentWindow) return;
+      if (typeof event.data !== "object" || event.data?.type !== "t3-screen:hello") return;
+      sendInit();
+    };
+    // A greeting can come before this listener exists. Every page links the runtime as a
+    // module script, which has run by the frame's load event, so answering then never misses.
+    const onLoad = (event: Event) => {
+      if (event.target === frameRef.current) sendInit();
     };
     // Theme, appearance, contrast and text size settings all land on the root element.
     const observer = new MutationObserver(() => {
@@ -149,9 +159,12 @@ function PluginScreenFrame(props: {
       attributeFilter: ["class", "style", "data-theme-id"],
     });
     window.addEventListener("message", onMessage);
+    // Load does not bubble; a capturing listener sees it for a frame rendered later.
+    document.addEventListener("load", onLoad, true);
     return () => {
       observer.disconnect();
       window.removeEventListener("message", onMessage);
+      document.removeEventListener("load", onLoad, true);
     };
   }, [placement, projectId]);
 

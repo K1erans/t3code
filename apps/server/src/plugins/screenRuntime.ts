@@ -40,9 +40,10 @@ if (framed) {
     if (data === null || typeof data !== "object") return;
     if (data.type === "t3-screen:theme") {
       applyTheme(data.appearance, data.tokens);
-    } else if (data.type === "t3-screen:init" && resolveConnection !== undefined) {
+    } else if (data.type === "t3-screen:init") {
+      // The host answers the greeting and the frame's load event, so init can come twice.
       applyTheme(data.context?.theme?.appearance, data.tokens);
-      resolveConnection(Object.freeze({ context: Object.freeze(data.context) }));
+      resolveConnection?.(Object.freeze({ context: Object.freeze(data.context) }));
       resolveConnection = undefined;
     }
   });
@@ -55,7 +56,9 @@ export function connect() {
       return;
     }
     const timeout = setTimeout(() => {
+      // Not cached: a later connect() greets the host again.
       resolveConnection = undefined;
+      connection = undefined;
       reject(new Error(NOT_IN_T3));
     }, CONNECT_TIMEOUT_MS);
     resolveConnection = (screen) => {

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vite-plus/test";
+import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
 import { SCREEN_RUNTIME_SOURCE } from "./screenRuntime.ts";
 
@@ -43,6 +43,7 @@ const loadFramedRuntime = async () => {
 };
 
 afterEach(() => {
+  vi.useRealTimers();
   Reflect.deleteProperty(globalThis, "window");
   Reflect.deleteProperty(globalThis, "document");
 });
@@ -80,5 +81,33 @@ describe("screen runtime", () => {
     expect(Object.fromEntries(frame.tokens)).toEqual({ "--t3-color-canvas": "#fff" });
     expect(frame.root.style.colorScheme).toBe("light");
     expect(frame.root.dataset.t3Appearance).toBe("light");
+  });
+
+  it("applies an init sent again on load, after the greeting was answered", async () => {
+    const frame = await loadFramedRuntime();
+    const context = { placement: "panel", projectId: null, theme: { appearance: "dark" } };
+    frame.fromHost({ type: "t3-screen:init", context, tokens: { "--t3-color-canvas": "#000" } });
+    frame.fromHost({
+      type: "t3-screen:init",
+      context: { ...context, theme: { appearance: "light" } },
+      tokens: { "--t3-color-canvas": "#fff" },
+    });
+    expect(Object.fromEntries(frame.tokens)).toEqual({ "--t3-color-canvas": "#fff" });
+    expect(frame.root.dataset.t3Appearance).toBe("light");
+    expect((await frame.runtime.connect()).context).toEqual(context);
+  });
+
+  it("greets the host again when connecting after an unanswered greeting timed out", async () => {
+    vi.useFakeTimers();
+    const frame = await loadFramedRuntime();
+    const first = frame.runtime.connect();
+    vi.advanceTimersByTime(10_000);
+    await expect(first).rejects.toThrow("This screen must run inside T3 Code");
+
+    const retry = frame.runtime.connect();
+    expect(frame.posted).toEqual([{ type: "t3-screen:hello" }, { type: "t3-screen:hello" }]);
+    const context = { placement: "panel", projectId: null, theme: { appearance: "dark" } };
+    frame.fromHost({ type: "t3-screen:init", context, tokens: {} });
+    expect((await retry).context).toEqual(context);
   });
 });
