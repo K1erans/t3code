@@ -65,20 +65,9 @@ const pluginSource = (disposalFile: string, message = "External plugin runtime i
 import { appendFile } from "node:fs/promises";
 
 export default function activate(api) {
-  api.registerCommand(
-    {
-      id: "${commandId}",
-      description: "Report status from an external local plugin package.",
-      surfaces: ["web", "desktop", "mobile"]
-    },
-    () => ({ message: ${encodeJsonString(message)}, tone: "success" })
+  api.registerCommand("${commandId}", () => ({ message: ${encodeJsonString(message)}, tone: "success" })
   );
-  api.registerCommand(
-    {
-      id: "${countCommandId}",
-      surfaces: ["web", "desktop", "mobile"]
-    },
-    async () => {
+  api.registerCommand("${countCommandId}", async () => {
       const count = await api.storage.update("invocations", (current) => (current ?? 0) + 1);
       return { message: "Invoked " + count + " times.", tone: "success" };
     }
@@ -91,24 +80,14 @@ const pluginSourceWithHelper = `
 import { message } from "./message.mjs";
 
 export default function activate(api) {
-  api.registerCommand(
-    {
-      id: "${commandId}",
-      surfaces: ["web", "desktop", "mobile"]
-    },
-    () => ({ message, tone: "success" })
+  api.registerCommand("${commandId}", () => ({ message, tone: "success" })
   );
 }
 `;
 
 const pluginSourceWithRetirementGate = (startedSymbol: string, releaseSymbol: string) => `
 export default function activate(api) {
-  api.registerCommand(
-    {
-      id: "${commandId}",
-      surfaces: ["web", "desktop", "mobile"]
-    },
-    () => ({ message: "retirement gate", tone: "success" })
+  api.registerCommand("${commandId}", () => ({ message: "retirement gate", tone: "success" })
   );
   api.onDispose(() => new Promise((resolve) => {
     const markStarted = Reflect.get(globalThis, Symbol.for(${encodeJsonString(startedSymbol)}));
@@ -120,12 +99,7 @@ export default function activate(api) {
 
 const pluginSourceWithCleanupFailure = `
 export default function activate(api) {
-  api.registerCommand(
-    {
-      id: "${commandId}",
-      surfaces: ["web", "desktop", "mobile"]
-    },
-    () => ({ message: "cleanup failure", tone: "success" })
+  api.registerCommand("${commandId}", () => ({ message: "cleanup failure", tone: "success" })
   );
   api.onDispose(() => { throw new Error("cleanup exploded"); });
 }
@@ -180,35 +154,36 @@ it.layer(NodeServices.layer)("plugin package lifecycle", (it) => {
     }),
   );
 
-  it.effect("serves status and commands before a slow startup activation finishes", () =>
+  it.effect("keeps enabled packages idle at startup until a command activates them", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
       const baseDir = yield* fileSystem.makeTempDirectoryScoped({
-        prefix: "t3code-plugin-package-slow-startup-test-",
+        prefix: "t3code-plugin-package-lazy-activation-test-",
       });
-      const gateSymbol = `t3.test.plugin.slow-startup.${baseDir}`;
+      const gateSymbol = `t3.test.plugin.lazy-activation.${baseDir}`;
       let release!: () => void;
       const released = new Promise<void>((resolve) => {
         release = resolve;
       });
+      let markActivating!: () => void;
+      const activatingStarted = new Promise<void>((resolve) => {
+        markActivating = resolve;
+      });
+      const gate = { activations: 0, started: markActivating, released };
       yield* Effect.acquireRelease(
-        Effect.sync(() => Reflect.set(globalThis, Symbol.for(gateSymbol), released)),
+        Effect.sync(() => Reflect.set(globalThis, Symbol.for(gateSymbol), gate)),
         () => Effect.sync(() => Reflect.deleteProperty(globalThis, Symbol.for(gateSymbol))),
       );
-      const packageDirectory = `${baseDir}/userdata/plugins/${packageId}`;
-      yield* fileSystem.makeDirectory(packageDirectory, { recursive: true });
-      yield* fileSystem.writeFileString(
-        `${packageDirectory}/t3-plugin.json`,
-        encodeManifest(manifest),
-      );
-      yield* fileSystem.writeFileString(
-        `${packageDirectory}/index.mjs`,
+      yield* writePackage(
+        baseDir,
+        packageId,
+        commandId,
         `export default async function activate(api) {
-  await globalThis[Symbol.for(${encodeJsonString(gateSymbol)})];
-  api.registerCommand(
-    { id: "${commandId}", surfaces: ["web", "desktop", "mobile"] },
-    () => ({ message: "ready", tone: "success" })
-  );
+  const gate = globalThis[Symbol.for(${encodeJsonString(gateSymbol)})];
+  gate.activations += 1;
+  gate.started();
+  await gate.released;
+  api.registerCommand("${commandId}", () => ({ message: "ready", tone: "success" }));
 }
 `,
       );
@@ -217,31 +192,207 @@ it.layer(NodeServices.layer)("plugin package lifecycle", (it) => {
         `{"enabled":["${packageId}"]}\n`,
       );
 
-      // The environment comes up while activation is still waiting on the gate.
       yield* useEnvironment(
         baseDir,
         Effect.gen(function* () {
           const manager = yield* PluginPackageManager.PluginPackageManager;
           const catalog = yield* PluginCommandCatalog.PluginCommandCatalog;
-          const status = yield* manager.status;
-          expect(status.packages).toMatchObject([
-            { id: packageId, enabled: true, state: "activating" },
-          ]);
-          expect(status.packages[0]?.error).toBeUndefined();
-          const listed = yield* catalog.list;
-          expect(listed.commands.map((command) => command.id)).not.toContain(commandId);
-          // Invocations answer without waiting for the activation.
-          expect(
-            (yield* Effect.flip(
-              manager.invokeCommand({ generation: listed.generation, id: commandId }),
-            ))._tag,
-          ).toBe("PluginCommandNotFoundError");
-
-          release();
+          // Rescan queues behind the startup load, which does not activate anything.
           expect(yield* manager.rescan).toMatchObject({
-            packages: [{ id: packageId, enabled: true, state: "active" }],
+            packages: [{ id: packageId, enabled: true, state: "idle" }],
           });
-          expect((yield* catalog.list).commands.map((command) => command.id)).toContain(commandId);
+          expect(gate.activations).toBe(0);
+          // The palette lists the command from the manifest.
+          const listed = yield* catalog.list;
+          expect(listed.commands).toEqual([
+            { id: commandId, label: "Test command", surfaces: ["web", "desktop"] },
+          ]);
+
+          // Both callers wait for the one activation instead of failing.
+          const input = { generation: listed.generation, id: commandId };
+          const first = yield* Effect.forkChild(manager.invokeCommand(input));
+          const second = yield* Effect.forkChild(manager.invokeCommand(input));
+          yield* Effect.promise(() => activatingStarted);
+          expect(yield* manager.status).toMatchObject({
+            packages: [{ id: packageId, state: "activating" }],
+          });
+          release();
+          expect(yield* Fiber.join(first)).toEqual({ message: "ready", tone: "success" });
+          expect(yield* Fiber.join(second)).toEqual({ message: "ready", tone: "success" });
+          expect(gate.activations).toBe(1);
+          expect(yield* manager.status).toMatchObject({
+            packages: [{ id: packageId, state: "active" }],
+          });
+          // Activating did not change the catalog clients hold.
+          expect(yield* catalog.list).toBe(listed);
+        }),
+      );
+    }),
+  );
+
+  it.effect("activates onStartup packages with the server and keeps them running", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3code-plugin-package-on-startup-test-",
+      });
+      const packageDirectory = yield* writePackage(baseDir, packageId, commandId, healthySource);
+      yield* fileSystem.writeFileString(
+        `${packageDirectory}/t3-plugin.json`,
+        encodeManifest({
+          ...manifest,
+          activationEvents: ["onStartup"],
+          contributes: { commands: [{ id: healthyCommandId, title: "Test command" }] },
+        }),
+      );
+      yield* fileSystem.writeFileString(
+        `${baseDir}/userdata/plugins.json`,
+        `{"enabled":["${packageId}"]}\n`,
+      );
+
+      yield* useEnvironment(
+        baseDir,
+        Effect.gen(function* () {
+          const manager = yield* PluginPackageManager.PluginPackageManager;
+          expect(yield* manager.rescan).toMatchObject({
+            packages: [{ id: packageId, state: "active" }],
+          });
+          yield* TestClock.adjust(
+            Duration.sum(
+              PluginPackageManager.IDLE_TIMEOUT,
+              PluginPackageManager.IDLE_CHECK_INTERVAL,
+            ),
+          );
+          expect(yield* manager.rescan).toMatchObject({
+            packages: [{ id: packageId, state: "active" }],
+          });
+        }),
+      );
+    }),
+  );
+
+  it.effect("shuts idle packages down and reactivates them on the next command", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3code-plugin-package-idle-test-",
+      });
+      const hookSymbol = `t3.test.plugin.idle.${baseDir}`;
+      const hook = { activations: 0, disposed: () => {} };
+      yield* Effect.acquireRelease(
+        Effect.sync(() => Reflect.set(globalThis, Symbol.for(hookSymbol), hook)),
+        () => Effect.sync(() => Reflect.deleteProperty(globalThis, Symbol.for(hookSymbol))),
+      );
+      yield* writePackage(
+        baseDir,
+        packageId,
+        commandId,
+        `export default function activate(api) {
+  const hook = globalThis[Symbol.for(${encodeJsonString(hookSymbol)})];
+  hook.activations += 1;
+  api.registerCommand("${commandId}", () => ({ message: "run " + hook.activations, tone: "success" }));
+  api.onDispose(() => hook.disposed());
+}
+`,
+      );
+      /** Resolves once the plugin's scope has been disposed. */
+      const nextDisposal = () =>
+        new Promise<void>((resolve) => {
+          hook.disposed = resolve;
+        });
+
+      yield* useEnvironment(
+        baseDir,
+        Effect.gen(function* () {
+          const manager = yield* PluginPackageManager.PluginPackageManager;
+          const catalog = yield* PluginCommandCatalog.PluginCommandCatalog;
+          yield* manager.enable(packageId);
+          const listed = yield* catalog.list;
+          const input = { generation: listed.generation, id: commandId };
+          expect(yield* manager.invokeCommand(input)).toMatchObject({ message: "run 1" });
+
+          // Short of the timeout, the package stays active.
+          yield* TestClock.adjust(
+            Duration.subtract(
+              PluginPackageManager.IDLE_TIMEOUT,
+              PluginPackageManager.IDLE_CHECK_INTERVAL,
+            ),
+          );
+          yield* manager.rescan;
+          expect(hook.activations).toBe(1);
+          expect(yield* manager.status).toMatchObject({
+            packages: [{ id: packageId, state: "active" }],
+          });
+
+          const disposed = nextDisposal();
+          yield* TestClock.adjust(PluginPackageManager.IDLE_CHECK_INTERVAL);
+          yield* Effect.promise(() => disposed);
+          // Rescan queues behind the idle shutdown that is disposing the package.
+          expect(yield* manager.rescan).toMatchObject({
+            packages: [{ id: packageId, enabled: true, state: "idle" }],
+          });
+          expect(yield* catalog.list).toBe(listed);
+
+          expect(yield* manager.invokeCommand(input)).toMatchObject({ message: "run 2" });
+          expect(yield* manager.status).toMatchObject({
+            packages: [{ id: packageId, state: "active" }],
+          });
+        }),
+      );
+    }),
+  );
+
+  it.effect("reactivates for a command that arrives while an idle shutdown is disposing", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3code-plugin-package-idle-race-test-",
+      });
+      const hookSymbol = `t3.test.plugin.idle-race.${baseDir}`;
+      let markDisposing!: () => void;
+      const disposing = new Promise<void>((resolve) => {
+        markDisposing = resolve;
+      });
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const hook = { activations: 0, disposing: markDisposing, released };
+      yield* Effect.acquireRelease(
+        Effect.sync(() => Reflect.set(globalThis, Symbol.for(hookSymbol), hook)),
+        () => Effect.sync(() => Reflect.deleteProperty(globalThis, Symbol.for(hookSymbol))),
+      );
+      yield* writePackage(
+        baseDir,
+        packageId,
+        commandId,
+        `export default function activate(api) {
+  const hook = globalThis[Symbol.for(${encodeJsonString(hookSymbol)})];
+  hook.activations += 1;
+  api.registerCommand("${commandId}", () => ({ message: "run " + hook.activations, tone: "success" }));
+  api.onDispose(() => { hook.disposing(); return hook.released; });
+}
+`,
+      );
+
+      yield* useEnvironment(
+        baseDir,
+        Effect.gen(function* () {
+          const manager = yield* PluginPackageManager.PluginPackageManager;
+          const catalog = yield* PluginCommandCatalog.PluginCommandCatalog;
+          yield* manager.enable(packageId);
+          const input = { generation: (yield* catalog.list).generation, id: commandId };
+
+          yield* TestClock.adjust(PluginPackageManager.IDLE_TIMEOUT);
+          yield* Effect.promise(() => disposing);
+          // The runtime no longer serves the command, but the shutdown has not finished.
+          const invoked = yield* Effect.forkChild(manager.invokeCommand(input));
+          yield* Effect.yieldNow;
+          release();
+          expect(yield* Fiber.join(invoked)).toEqual({ message: "run 2", tone: "success" });
+          expect(yield* manager.status).toMatchObject({
+            packages: [{ id: packageId, state: "active" }],
+          });
         }),
       );
     }),
@@ -298,11 +449,13 @@ it.layer(NodeServices.layer)("plugin package lifecycle", (it) => {
           const manager = yield* PluginPackageManager.PluginPackageManager;
           const catalog = yield* PluginCommandCatalog.PluginCommandCatalog;
 
-          // Rescan queues behind startup activation, so it returns once that finished.
+          // Rescan queues behind the startup load, which leaves the package idle.
           expect(yield* manager.rescan).toMatchObject({
-            packages: [{ id: packageId, enabled: true, state: "active" }],
+            packages: [{ id: packageId, enabled: true, state: "idle" }],
           });
-          expect((yield* catalog.list).commands.map((command) => command.id)).toContain(commandId);
+          const listed = yield* catalog.list;
+          expect(listed.commands.map((command) => command.id)).toContain(commandId);
+          yield* manager.invokeCommand({ generation: listed.generation, id: commandId });
 
           expect(yield* manager.disable(packageId)).toMatchObject({
             packages: [{ id: packageId, enabled: false, state: "disabled" }],
@@ -386,9 +539,10 @@ export default function activate() {}
       );
 
       const count = Effect.gen(function* () {
+        const manager = yield* PluginPackageManager.PluginPackageManager;
         const catalog = yield* PluginCommandCatalog.PluginCommandCatalog;
         const listed = yield* catalog.list;
-        return (yield* catalog.invoke({ generation: listed.generation, id: countCommandId }))
+        return (yield* manager.invokeCommand({ generation: listed.generation, id: countCommandId }))
           .message;
       });
 
@@ -535,14 +689,14 @@ export default function activate() {}
           expect(yield* manager.status).toMatchObject({
             packages: [{ id: packageId, version: "2.0.0", enabled: true, state: "active" }],
           });
-          const reloaded = yield* catalog.list;
-          expect(reloaded.generation).toBeGreaterThan(committed.generation);
-          expect(yield* catalog.invoke({ generation: reloaded.generation, id: commandId })).toEqual(
-            {
-              message: "generation two",
-              tone: "success",
-            },
-          );
+          // The same commands, so clients' catalog generation stays valid.
+          expect(yield* catalog.list).toBe(committed);
+          expect(
+            yield* catalog.invoke({ generation: committed.generation, id: commandId }),
+          ).toEqual({
+            message: "generation two",
+            tone: "success",
+          });
         }),
       );
     }),
@@ -644,7 +798,7 @@ export default function activate() {}
           expect(disabled._tag).toBe("Failure");
           expect((yield* catalog.list).commands.map((command) => command.id)).toContain(commandId);
           expect(yield* manager.status).toMatchObject({
-            packages: [{ id: packageId, enabled: true, state: "active" }],
+            packages: [{ id: packageId, enabled: true, state: "idle" }],
           });
         }),
       );
@@ -801,9 +955,7 @@ const commandPluginSource = (handlerSource: string, disposalFile: string) => `
 import { appendFile } from "node:fs/promises";
 
 export default function activate(api) {
-  api.registerCommand(
-    { id: "${commandId}", surfaces: ["web", "desktop", "mobile"] },
-    ${handlerSource}
+  api.registerCommand("${commandId}", ${handlerSource}
   );
   api.onDispose(() => appendFile(${encodeJsonString(disposalFile)}, "disposed\\n"));
 }
@@ -811,9 +963,7 @@ export default function activate(api) {
 
 const healthySource = `
 export default function activate(api) {
-  api.registerCommand(
-    { id: "${healthyCommandId}", surfaces: ["web", "desktop", "mobile"] },
-    () => ({ message: "still healthy", tone: "success" })
+  api.registerCommand("${healthyCommandId}", () => ({ message: "still healthy", tone: "success" })
   );
 }
 `;
@@ -888,9 +1038,7 @@ const gate = globalThis[Symbol.for(${encodeJsonString(gateSymbol)})];
 gate.loads += 1;
 ${onLoad}
 export default function activate(api) {
-  api.registerCommand(
-    { id: "${commandId}", surfaces: ["web", "desktop", "mobile"] },
-    () => gate.calls++ === 0
+  api.registerCommand("${commandId}", () => gate.calls++ === 0
       ? new Promise((_, reject) => { gate.reject = reject; gate.started(); })
       : { message: "reloaded", tone: "success" }
   );
@@ -964,6 +1112,53 @@ it.layer(NodeServices.layer)("plugin failure containment", (it) => {
       }),
     );
   }
+
+  it.effect("fails the command that triggers a failing activation and keeps the reason", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3code-plugin-lazy-activation-failure-test-",
+      });
+      yield* writePackage(
+        baseDir,
+        packageId,
+        commandId,
+        "export default function activate() { throw new Error('boom') }",
+      );
+      yield* writePackage(baseDir, healthyPackageId, healthyCommandId, healthySource);
+      yield* fileSystem.writeFileString(
+        `${baseDir}/userdata/plugins.json`,
+        `{"enabled":["${healthyPackageId}","${packageId}"]}\n`,
+      );
+
+      yield* useEnvironment(
+        baseDir,
+        Effect.gen(function* () {
+          const manager = yield* PluginPackageManager.PluginPackageManager;
+          const catalog = yield* PluginCommandCatalog.PluginCommandCatalog;
+          yield* manager.rescan;
+          const listed = yield* catalog.list;
+          const failure = yield* Effect.flip(
+            manager.invokeCommand({ generation: listed.generation, id: commandId }),
+          );
+          expect(failure._tag).toBe("PluginCommandInvocationError");
+          const encoded = encodeInvocationError(failure);
+          expect(encoded).toContain("activate threw: boom");
+          expect(encoded).not.toContain("index.mjs");
+
+          expect((yield* manager.status).packages).toMatchObject([
+            { id: healthyPackageId, state: "idle" },
+            { id: packageId, enabled: true, state: "error", error: "activate threw: boom" },
+          ]);
+          const after = yield* catalog.list;
+          expect(after.commands.map((command) => command.id)).toEqual([healthyCommandId]);
+          expect(
+            yield* manager.invokeCommand({ generation: after.generation, id: healthyCommandId }),
+          ).toEqual({ message: "still healthy", tone: "success" });
+        }),
+      );
+    }),
+  );
 
   for (const { outcome, handler } of failureCases) {
     it.effect(`retires the plugin whose command ${outcome} and keeps the reason`, () =>
@@ -1356,10 +1551,10 @@ it.layer(NodeServices.layer)("plugin package pickup", (it) => {
             commandId,
           );
 
-          // Reinstalling brings the still-enabled package back.
+          // Reinstalling brings the still-enabled package back, idle until a command runs.
           yield* install(`${baseDir}/sources/v2`);
           expect(yield* manager.rescan).toMatchObject({
-            packages: [{ id: "com.acme.other" }, { id: packageId, state: "active" }],
+            packages: [{ id: "com.acme.other" }, { id: packageId, state: "idle" }],
           });
         }),
       );
@@ -1533,9 +1728,7 @@ export default async function activate(api) {
     gate.started();
     await new Promise(() => {});
   }
-  api.registerCommand(
-    { id: "${commandId}", surfaces: ["web", "desktop", "mobile"] },
-    () => ({ message: "two", tone: "success" })
+  api.registerCommand("${commandId}", () => ({ message: "two", tone: "success" })
   );
 }
 `,

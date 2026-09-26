@@ -35,10 +35,14 @@ const ClosedStruct = <Fields extends Schema.Struct.Fields>(fields: Fields) => {
   );
 };
 
-/** An argument-free palette command; `title` is the label the palette shows. */
+/**
+ * An argument-free palette command; `title` is the label the palette shows. The palette
+ * lists it from the manifest, so it appears before its plugin has activated.
+ */
 const CommandContribution = ClosedStruct({
   id: NamespacedId,
   title: Schema.String.check(Schema.isNonEmpty(), Schema.isMaxLength(120)),
+  description: Schema.optional(Schema.String.check(Schema.isMaxLength(500))),
 });
 
 export const PluginManifest = ClosedStruct({
@@ -52,6 +56,11 @@ export const PluginManifest = ClosedStruct({
   /** Host capabilities the plugin needs. This is the only compatibility check. */
   requires: Schema.Array(CapabilityId),
   surfaces: Schema.optional(Schema.Array(Schema.Literals(["web", "desktop", "mobile"]))),
+  /**
+   * Plugins activate when one of their commands runs. `onStartup` also activates the
+   * plugin with the server and keeps it running; prefer the implicit triggers.
+   */
+  activationEvents: Schema.optional(Schema.Array(Schema.Literal("onStartup"))),
   entrypoints: Schema.optional(ClosedStruct({ server: Schema.optional(RelativeEntrypoint) })),
   contributes: Schema.optional(
     ClosedStruct({ commands: Schema.optional(Schema.Array(CommandContribution)) }),

@@ -12,9 +12,16 @@ const validManifest = {
   version: "1.2.0",
   requires: ["t3.commands@0", "t3.storage@0"],
   surfaces: ["web", "desktop"],
+  activationEvents: ["onStartup"],
   entrypoints: { server: "./dist/server.js" },
   contributes: {
-    commands: [{ id: "linear.create-issue", title: "Linear: create issue" }],
+    commands: [
+      {
+        id: "linear.create-issue",
+        title: "Linear: create issue",
+        description: "Opens a new issue.",
+      },
+    ],
   },
 };
 
@@ -36,6 +43,12 @@ describe("PluginManifest", () => {
     expect(() => decodeManifest(withoutName)).toThrow();
     const { requires: _requires, ...withoutRequires } = minimal;
     expect(() => decodeManifest(withoutRequires)).toThrow();
+  });
+
+  it("accepts only onStartup as an explicit activation event", () => {
+    expect(() =>
+      decodeManifest({ ...validManifest, activationEvents: ["onTurnStateChange"] }),
+    ).toThrow();
   });
 
   it("rejects unsupported manifest versions and fields outside the manifest", () => {

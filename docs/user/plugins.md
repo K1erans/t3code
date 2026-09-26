@@ -22,3 +22,9 @@ A running server picks up changes without a restart. New plugins appear disabled
 **Settings → Plugins**; enable them there. An enabled plugin reloads when you reinstall it, and if
 you remove it, it shows as not installed until you install it again. A removed disabled plugin
 simply leaves the list. If a change does not show up, use **Rescan** in Settings → Plugins.
+
+## Active and idle
+
+An enabled plugin starts when you run one of its commands and stops again after ten minutes
+without use, so plugins do not run in the background while you are not using them. **Settings → Plugins**
+shows each one as **Active** or **Idle**; an idle plugin's commands stay in the command palette.
