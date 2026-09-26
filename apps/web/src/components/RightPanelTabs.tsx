@@ -8,6 +8,7 @@ import {
 import type {
   ContextMenuItem,
   EnvironmentId,
+  PluginScreen,
   PreviewSessionSnapshot,
   ProjectId,
   PullRequestState,
@@ -23,6 +24,7 @@ import {
   Files,
   Globe2,
   Plus,
+  PuzzleIcon,
   TerminalSquare,
   Volume2,
   VolumeOff,
@@ -42,6 +44,7 @@ import {
 import { isElectron } from "~/env";
 import type { DesktopPreviewOverlay } from "~/previewStateStore";
 import type { RightPanelSurface } from "~/rightPanelStore";
+import { PluginScreenMenuItems } from "~/components/plugins/PluginScreenMenuItems";
 import { cn } from "~/lib/utils";
 import { readLocalApi } from "~/localApi";
 import { Button } from "~/components/ui/button";
@@ -123,6 +126,10 @@ interface RightPanelTabsProps {
   onAddPullRequests: () => void;
   onAddAgents: () => void;
   onAddDevice: () => void;
+  /** Offers the environment's plugin screens in the add-tab menu when set. */
+  onAddPluginScreen?: (screen: PluginScreen) => void;
+  /** Whether the panel's thread has a project, which project-scoped screens need. */
+  pluginProjectAvailable?: boolean;
   browserAvailable: boolean;
   terminalAvailable: boolean;
   diffAvailable: boolean;
@@ -632,6 +639,8 @@ function surfaceTitle(
       return "Agents";
     case "device":
       return surface.title ?? surface.target?.name ?? "Device";
+    case "plugin":
+      return surface.title;
     case "preview": {
       const snapshot = surface.resourceId ? sessions[surface.resourceId] : null;
       if (!snapshot || snapshot.navStatus._tag === "Idle") return "Browser";
@@ -715,6 +724,8 @@ function SurfaceIcon({
       return <PullRequestGlyph.link className="size-3 shrink-0" />;
     case "agents":
       return <Bot className="size-3 shrink-0" />;
+    case "plugin":
+      return <PuzzleIcon className="size-3 shrink-0" />;
     case "device":
       return surface.target?.platform === "ios" ? (
         <AppleIcon className="size-3 shrink-0" />
@@ -1342,6 +1353,13 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
                       </SurfaceMenuItem>
                     );
                   })}
+                  {props.onAddPluginScreen && props.environmentId !== null ? (
+                    <PluginScreenMenuItems
+                      environmentId={props.environmentId}
+                      projectAvailable={props.pluginProjectAvailable ?? false}
+                      onOpen={props.onAddPluginScreen}
+                    />
+                  ) : null}
                 </MenuPopup>
               </Menu>
             ) : null}

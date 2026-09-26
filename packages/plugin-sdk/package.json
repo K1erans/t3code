@@ -1,0 +1,18 @@
+{
+  "name": "@t3tools/plugin-sdk",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./screen": {
+      "types": "./src/screen.ts",
+      "import": "./src/screen.ts"
+    }
+  },
+  "scripts": {
+    "test": "vp test run",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "vite-plus": "catalog:"
+  }
+}

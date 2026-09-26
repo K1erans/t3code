@@ -494,7 +494,7 @@ export default function activate() {}
 `,
       );
       const reason =
-        "Needs t3.screens@2; this T3 provides t3.commands@0, t3.storage@0. Update T3 or use an older version of the plugin.";
+        "Needs t3.screens@2; this T3 provides t3.commands@0, t3.screens@0, t3.storage@0. Update T3 or use an older version of the plugin.";
 
       yield* useEnvironment(
         baseDir,
@@ -517,6 +517,59 @@ export default function activate() {}
       );
 
       expect(yield* fileSystem.exists(activatedFile)).toBe(false);
+    }),
+  );
+
+  it.effect("fails loading a plugin whose screen entry is missing", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3code-plugin-package-screen-entry-test-",
+      });
+      const packageDirectory = yield* writePackage(
+        baseDir,
+        packageId,
+        commandId,
+        "export default function activate() {}\n",
+      );
+      yield* fileSystem.writeFileString(
+        `${packageDirectory}/t3-plugin.json`,
+        encodeManifest({
+          ...manifest,
+          requires: ["t3.screens@0"],
+          contributes: {
+            screens: [
+              {
+                id: "board",
+                title: "Board",
+                entry: "./dist/index.html",
+                placement: "panel",
+                scope: "project",
+              },
+            ],
+          },
+        }),
+      );
+
+      yield* useEnvironment(
+        baseDir,
+        Effect.gen(function* () {
+          const manager = yield* PluginPackageManager.PluginPackageManager;
+          const catalog = yield* PluginCommandCatalog.PluginCommandCatalog;
+          const failure = yield* Effect.flip(manager.enable(packageId));
+          expect(failure.message).toContain("screen board entry ./dist/index.html does not exist");
+          expect((yield* catalog.list).screens).toEqual([]);
+          expect(yield* manager.screen(packageId, "board")).toBeUndefined();
+          // A folder with the entry's name is not an entry file either.
+          yield* fileSystem.makeDirectory(`${packageDirectory}/dist/index.html`, {
+            recursive: true,
+          });
+          const folderFailure = yield* Effect.flip(manager.enable(packageId));
+          expect(folderFailure.message).toContain(
+            "screen board entry ./dist/index.html does not exist",
+          );
+        }),
+      );
     }),
   );
 

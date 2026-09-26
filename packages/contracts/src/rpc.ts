@@ -122,6 +122,11 @@ import {
   PluginPackageStatusSnapshot,
 } from "./pluginPackages.ts";
 import {
+  PluginScreenUnavailableError,
+  PluginScreenUrlInput,
+  PluginScreenUrlResult,
+} from "./pluginScreens.ts";
+import {
   PullRequestActionInput,
   PullRequestActivity,
   PullRequestCommentInput,
@@ -411,6 +416,9 @@ export const WS_METHODS = {
   pluginPackagesReload: "pluginPackages.reload",
   pluginPackagesRescan: "pluginPackages.rescan",
 
+  // Plugin screen methods
+  pluginScreensUrl: "pluginScreens.url",
+
   // Cloud environment methods
   cloudGetRelayClientStatus: "cloud.getRelayClientStatus",
   cloudInstallRelayClient: "cloud.installRelayClient",
@@ -537,6 +545,12 @@ export const WsPluginPackagesRescanRpc = Rpc.make(WS_METHODS.pluginPackagesResca
   payload: Schema.Struct({}),
   success: PluginPackageStatusSnapshot,
   error: Schema.Union([PluginPackageOperationError, EnvironmentAuthorizationError]),
+});
+
+export const WsPluginScreensUrlRpc = Rpc.make(WS_METHODS.pluginScreensUrl, {
+  payload: PluginScreenUrlInput,
+  success: PluginScreenUrlResult,
+  error: Schema.Union([PluginScreenUnavailableError, EnvironmentAuthorizationError]),
 });
 
 const WsServerRefreshProvidersRpc = Rpc.make(WS_METHODS.serverRefreshProviders, {
@@ -1478,6 +1492,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsPluginPackagesDisableRpc,
   WsPluginPackagesReloadRpc,
   WsPluginPackagesRescanRpc,
+  WsPluginScreensUrlRpc,
   WsServerRefreshProvidersRpc,
   WsServerUpdateProviderRpc,
   WsProviderConsumeResetCreditRpc,

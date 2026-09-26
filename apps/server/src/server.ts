@@ -37,6 +37,9 @@ import {
 import { guardHttpResponseWriteErrors } from "./httpResponseErrorGuard.ts";
 import { fixPath } from "./os-jank.ts";
 import { websocketRpcRouteLayer } from "./ws.ts";
+import * as PluginCommandCatalog from "./plugins/PluginCommandCatalog.ts";
+import * as PluginPackageManager from "./plugins/PluginPackageManager.ts";
+import { pluginScreenRouteLayer } from "./plugins/PluginScreenAccess.ts";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
 import * as NodePtyAdapter from "./terminal/NodePtyAdapter.ts";
 import { pullRequestHttpApiLayer } from "./pullRequest/http.ts";
@@ -595,6 +598,7 @@ export const makeRoutesLayer = Layer.mergeAll(
     otlpTracesProxyRouteLayer,
     assetRouteLayer,
     attachmentUploadRouteLayer,
+    pluginScreenRouteLayer,
     deviceHubProxyRouteLayer,
     staticAndDevRouteLayer,
     websocketRpcRouteLayer,
@@ -605,6 +609,9 @@ export const makeRoutesLayer = Layer.mergeAll(
   // and mutations observed on WebSocket invalidate patches subsequently read over HTTP.
   Layer.provide(PullRequestServiceLive),
   Layer.provide(PreviewAutomationBroker.layer),
+  // The WebSocket RPCs and the screen route share one manager, so a screen URL minted over
+  // the socket resolves against the same loaded plugins.
+  Layer.provide(PluginPackageManager.layer.pipe(Layer.provideMerge(PluginCommandCatalog.layer))),
   Layer.provide(ServerSelfUpdate.layer.pipe(Layer.provide(DesktopAppUpdateLayerLive))),
   Layer.provide(commandReadinessLayer),
   Layer.provide(browserApiCorsLayer),

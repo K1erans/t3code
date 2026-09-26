@@ -25,6 +25,7 @@ import {
   type MessageId,
   type ModelSelection,
   type ProjectScript,
+  type PluginScreen,
   type ProjectId,
   type ProviderApprovalDecision,
   type PreviewAnnotationPayload,
@@ -621,6 +622,8 @@ const DevicePanel = lazy(() =>
   import("./device/DevicePanel").then((module) => ({ default: module.DevicePanel })),
 );
 const FilePreviewPanel = lazy(() => import("./files/FilePreviewPanel"));
+// Split out so clients that never open a plugin screen never load the frame host.
+const PluginScreenPanel = lazy(() => import("./plugins/PluginScreenPanel"));
 const EMPTY_PENDING_FILE_SURFACE_IDS: ReadonlySet<string> = new Set();
 const TYPE_TO_FOCUS_EDITABLE_SELECTOR = [
   "input",
@@ -4585,6 +4588,17 @@ export default function ChatView(props: ChatViewProps) {
     if (!activeThreadRef) return;
     useRightPanelStore.getState().open(activeThreadRef, "agents");
   }, [activeThreadRef]);
+  const addPluginScreenSurface = useCallback(
+    (screen: PluginScreen) => {
+      if (!activeThreadRef) return;
+      useRightPanelStore.getState().openPluginScreen(activeThreadRef, {
+        pluginId: screen.pluginId,
+        screenId: screen.id,
+        title: screen.title,
+      });
+    },
+    [activeThreadRef],
+  );
   const supportsThreadPullRequests =
     serverConfig?.environment.capabilities.threadPullRequests === true;
   const visiblePullRequests = visibleThreadPullRequests(
@@ -9737,6 +9751,18 @@ export default function ChatView(props: ChatViewProps) {
         environmentId={activeThreadRef?.environmentId ?? null}
         threadId={activeThreadRef?.threadId ?? null}
       />
+    ) : renderedRightPanelSurface?.kind === "plugin" ? (
+      <Suspense fallback={null}>
+        <PluginScreenPanel
+          key={renderedRightPanelSurface.id}
+          environmentId={activeThread.environmentId}
+          pluginId={renderedRightPanelSurface.pluginId}
+          screenId={renderedRightPanelSurface.screenId}
+          title={renderedRightPanelSurface.title}
+          projectId={activeThread.projectId ?? null}
+          visible={rightPanelOpen}
+        />
+      </Suspense>
     ) : renderedRightPanelSurface?.kind === "device" ? (
       <Suspense fallback={null}>
         <DevicePanel
@@ -10393,6 +10419,8 @@ export default function ChatView(props: ChatViewProps) {
           onAddPullRequests={addPullRequestsSurface}
           onAddAgents={addAgentsSurface}
           onAddDevice={addDeviceSurface}
+          onAddPluginScreen={addPluginScreenSurface}
+          pluginProjectAvailable={activeProject !== null}
           browserAvailable={isPreviewSupportedInRuntime()}
           terminalAvailable={activeProject !== null}
           diffAvailable={isServerThread && isGitRepo}
@@ -10450,6 +10478,8 @@ export default function ChatView(props: ChatViewProps) {
             onAddPullRequests={addPullRequestsSurface}
             onAddAgents={addAgentsSurface}
             onAddDevice={addDeviceSurface}
+            onAddPluginScreen={addPluginScreenSurface}
+            pluginProjectAvailable={activeProject !== null}
             browserAvailable={isPreviewSupportedInRuntime()}
             terminalAvailable={activeProject !== null}
             diffAvailable={isServerThread && isGitRepo}

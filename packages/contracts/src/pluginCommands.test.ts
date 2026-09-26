@@ -19,6 +19,7 @@ describe("plugin command contracts", () => {
     Effect.gen(function* () {
       const catalog = yield* decodeCatalog({
         generation: 3,
+        screens: [],
         commands: [
           {
             id: "t3.runtime-status",
@@ -40,6 +41,7 @@ describe("plugin command contracts", () => {
         decodeCatalog({
           generation: 1,
           commands: [{ id: "acme.command", label: "Command", surfaces: ["server"] }],
+          screens: [],
         }),
       );
       expect(exit._tag).toBe("Failure");
