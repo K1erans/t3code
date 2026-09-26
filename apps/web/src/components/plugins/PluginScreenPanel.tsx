@@ -7,7 +7,7 @@
  * itself with a message from the frame's window, and the host answers with the screen's
  * context. The frame is recognized by `event.source`, never by origin, which is `"null"`.
  */
-import { useAtomValue } from "@effect/atom-react";
+import { useAtomRefresh, useAtomValue } from "@effect/atom-react";
 import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
@@ -38,6 +38,9 @@ import { useAtomCommand } from "~/state/use-atom-command";
 import { useEnvironmentOperateAccess } from "../settings/EnvironmentIconPicker";
 import { pluginActionErrorText } from "../settings/PluginsSettings.logic";
 
+/** How long before its token expires an open screen fetches a new URL. */
+const URL_RENEW_MARGIN_MS = 10 * 60 * 1000;
+
 interface PluginScreenPanelProps {
   readonly environmentId: EnvironmentId;
   readonly pluginId: string;
@@ -63,13 +66,15 @@ export default function PluginScreenPanel(props: PluginScreenPanelProps) {
   );
   if (screen === undefined) return <PluginScreenPlaceholder {...props} />;
   if (!props.visible) return null;
-  // A reload changes the revision, so the frame is rebuilt from a freshly minted URL.
+  const projectId = screen.scope === "project" ? props.projectId : null;
+  // A reload changes the revision, so the frame is rebuilt from a freshly minted URL. The
+  // screen is told its project only when it connects, so another project rebuilds it too.
   return (
     <PluginScreenFrame
-      key={screen.revision}
+      key={`${screen.revision}:${projectId ?? ""}`}
       environmentId={props.environmentId}
       screen={screen}
-      projectId={screen.scope === "project" ? props.projectId : null}
+      projectId={projectId}
     />
   );
 }
@@ -81,12 +86,19 @@ function PluginScreenFrame(props: {
 }) {
   const { environmentId, screen } = props;
   const connection = usePreparedConnection(environmentId);
-  const minted = useAtomValue(
-    serverEnvironment.pluginScreenUrl({
-      environmentId,
-      input: { pluginId: screen.pluginId, screenId: screen.id, revision: screen.revision },
-    }),
-  );
+  const urlAtom = serverEnvironment.pluginScreenUrl({
+    environmentId,
+    input: { pluginId: screen.pluginId, screenId: screen.id, revision: screen.revision },
+  });
+  const minted = useAtomValue(urlAtom);
+  const refreshUrl = useAtomRefresh(urlAtom);
+  // The URL's token expires; an open screen gets a new one shortly before, which reloads it.
+  const expiresAt = minted._tag === "Success" ? minted.value.expiresAt : undefined;
+  useEffect(() => {
+    if (expiresAt === undefined) return;
+    const timer = setTimeout(refreshUrl, Math.max(0, expiresAt - Date.now() - URL_RENEW_MARGIN_MS));
+    return () => clearTimeout(timer);
+  }, [expiresAt, refreshUrl]);
   const { resolvedTheme } = useTheme();
   const frameRef = useRef<HTMLIFrameElement>(null);
   const context = {

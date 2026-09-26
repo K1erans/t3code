@@ -21,6 +21,8 @@ export type PluginScreenUrlInput = typeof PluginScreenUrlInput.Type;
 export const PluginScreenUrlResult = Schema.Struct({
   /** Resolve against the environment's HTTP base URL. The token in it is the only credential. */
   relativeUrl: TrimmedNonEmptyString,
+  /** Epoch milliseconds after which the URL stops working; fetch a new one before then. */
+  expiresAt: Schema.optional(NonNegativeInt),
 });
 export type PluginScreenUrlResult = typeof PluginScreenUrlResult.Type;
 

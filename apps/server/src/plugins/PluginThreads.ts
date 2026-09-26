@@ -20,6 +20,7 @@ import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -192,7 +193,10 @@ export class PluginThreads extends Context.Service<
   {
     readonly listProjects: Effect.Effect<ReadonlyArray<PluginProject>, PluginThreadsError>;
     readonly getProject: (id: string) => Effect.Effect<PluginProject | null, PluginThreadsError>;
-    /** Creates a thread and starts its first turn with `prompt`. */
+    /**
+     * Creates a thread and starts its first turn with `prompt`. Resolves once the thread
+     * exists; a worktree checkout and setup script finish afterwards.
+     */
     readonly createThread: (input: unknown) => Effect.Effect<PluginThread, PluginThreadsError>;
     readonly getThread: (id: string) => Effect.Effect<PluginThread | null, PluginThreadsError>;
     /**
@@ -220,6 +224,8 @@ export const make = Effect.gen(function* () {
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   const projectFiles = yield* T3ProjectFileLoader.T3ProjectFileLoader;
   const gitWorkflow = yield* GitWorkflowService.GitWorkflowService;
+  // Bootstraps outlive the plugin call that started them.
+  const bootstrapScope = yield* Effect.scope;
 
   const uuid = crypto.randomUUIDv4.pipe(Effect.catch(failWith("Could not generate an id")));
 
@@ -274,7 +280,7 @@ export const make = Effect.gen(function* () {
 
     const threadId = ThreadId.make(yield* uuid);
     const createdAt = DateTime.formatIso(yield* DateTime.now);
-    yield* dispatcher
+    const bootstrap = dispatcher
       .dispatch({
         type: "thread.turn.start",
         commandId: CommandId.make(`plugin:thread-start:${yield* uuid}`),
@@ -318,6 +324,30 @@ export const make = Effect.gen(function* () {
       })
       .pipe(Effect.mapError((error) => new PluginThreadsError({ reason: error.message })));
 
+    // A worktree checkout and setup script can run for minutes, longer than a plugin
+    // call may. The thread is real once it is created, so return then and let the
+    // rest of the bootstrap run on; a failed setup deletes the thread.
+    yield* Effect.scoped(
+      Effect.gen(function* () {
+        const events = yield* engine.subscribeDomainEvents;
+        const running = yield* bootstrap.pipe(
+          Effect.tapCause((cause) =>
+            Effect.logWarning("Plugin thread bootstrap failed", { threadId, cause }),
+          ),
+          Effect.forkIn(bootstrapScope),
+        );
+        const threadCreated = events.pipe(
+          Stream.filter(
+            (event) => event.type === "thread.created" && event.aggregateId === threadId,
+          ),
+          Stream.runHead,
+          // A closed subscription never announces it; the bootstrap still settles the race.
+          Effect.flatMap(Option.match({ onNone: () => Effect.never, onSome: () => Effect.void })),
+        );
+        yield* Effect.raceFirst(Fiber.join(running), threadCreated);
+      }),
+    );
+
     const created = yield* findThread(threadId);
     return created === null
       ? ({
@@ -330,17 +360,27 @@ export const make = Effect.gen(function* () {
   });
 
   const turnStateChanges = Effect.gen(function* () {
-    // Subscribe before reading states, so no change between the two is lost.
-    const events = yield* engine.subscribeDomainEvents;
+    // States first, then the subscription, then the stored events in between, so every
+    // event after the states is seen exactly once and compared against the state before it.
     const snapshot = yield* snapshots
       .getShellSnapshot()
       .pipe(Effect.catch(failWith("Could not read thread states")));
+    const live = yield* engine.subscribeDomainEvents;
+    const missed = yield* Stream.runCollect(engine.readEvents(snapshot.snapshotSequence)).pipe(
+      Effect.catch(failWith("Could not read thread states")),
+    );
+    let lastSequence = snapshot.snapshotSequence;
     // Last known state per thread, so only real transitions reach plugins. A thread
     // missing here was created after the snapshot, and new threads start idle.
     const lastStates = new Map<string, PluginTurnState>(
       snapshot.threads.map((thread) => [thread.id, turnStateOf(thread)]),
     );
-    return events.pipe(
+    return Stream.concat(Stream.fromIterable(missed), live).pipe(
+      Stream.filter((event) => {
+        if (event.sequence <= lastSequence) return false;
+        lastSequence = event.sequence;
+        return true;
+      }),
       Stream.filter(
         (event) =>
           event.aggregateKind === "thread" &&

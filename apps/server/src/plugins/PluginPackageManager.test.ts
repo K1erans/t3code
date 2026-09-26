@@ -17,6 +17,7 @@ import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
+import { PluginRuntime } from "@t3tools/plugin-runtime";
 import { PluginManifest } from "@t3tools/plugin-runtime/manifest";
 
 import * as ServerConfig from "../config.ts";
@@ -120,6 +121,8 @@ export default function activate(api) {
 interface EnvironmentLayerOptions {
   readonly entryPointTimeout?: Duration.Input;
   readonly threads?: PluginThreads.PluginThreads["Service"];
+  /** Called as each runtime reconcile starts, with the ids that will stay active. */
+  readonly onReconcile?: (activeIds: ReadonlyArray<string>) => void;
 }
 
 /** Thread access for tests that do not use it: no projects, threads or turn state changes. */
@@ -134,10 +137,26 @@ const noThreads = PluginThreads.PluginThreads.of({
 const makeEnvironmentLayer = (baseDir: string, options?: EnvironmentLayerOptions) => {
   const configLayer = Layer.fresh(ServerConfig.layerTest(process.cwd(), baseDir));
   const entryPointTimeout = options?.entryPointTimeout;
+  const onReconcile = options?.onReconcile;
+  const catalogLayer =
+    onReconcile === undefined
+      ? PluginCommandCatalog.layer
+      : Layer.effect(
+          PluginCommandCatalog.PluginCommandCatalog,
+          PluginCommandCatalog.make.pipe(
+            Effect.map((catalog) => ({
+              ...catalog,
+              reconcile: (definitions: Parameters<typeof catalog.reconcile>[0]) =>
+                Effect.sync(() => onReconcile(definitions.map((definition) => definition.id))).pipe(
+                  Effect.andThen(catalog.reconcile(definitions)),
+                ),
+            })),
+          ),
+        ).pipe(Layer.provide(PluginRuntime.layer()));
   return PluginPackageManager.layerWith(
     entryPointTimeout === undefined ? {} : { entryPointTimeout },
   ).pipe(
-    Layer.provideMerge(PluginCommandCatalog.layer),
+    Layer.provideMerge(catalogLayer),
     Layer.provide(Layer.succeed(PluginThreads.PluginThreads, options?.threads ?? noThreads)),
     Layer.provideMerge(configLayer),
   );
@@ -749,6 +768,9 @@ export default function activate() {}
           recursive: true,
         });
       }
+      // A plain file named after an id is not a plugin, so it protects nothing.
+      yield* fileSystem.makeDirectory(`${baseDir}/userdata/plugins`, { recursive: true });
+      yield* fileSystem.writeFileString(`${baseDir}/userdata/plugins/com.acme.expired`, "");
       // A plugin whose manifest is unreadable or missing is still installed, so its data stays.
       yield* fileSystem.makeDirectory(`${baseDir}/userdata/plugins/com.acme.bare`, {
         recursive: true,
@@ -858,6 +880,10 @@ export default function activate() {}
       const commandStarted = new Promise<void>((resolve) => {
         markStarted = resolve;
       });
+      let markRetiring!: () => void;
+      const retiring = new Promise<void>((resolve) => {
+        markRetiring = resolve;
+      });
       yield* Effect.acquireRelease(
         Effect.sync(() =>
           Reflect.set(globalThis, Symbol.for(gateSymbol), { started: markStarted, released }),
@@ -896,6 +922,8 @@ export default function activate() {}
           // finishes, so the delete queued behind it never closes a store in use.
           yield* fileSystem.remove(packageDirectory, { recursive: true });
           const rescanned = yield* Effect.forkChild(manager.rescan);
+          // The rescan has retired the plugin and now waits for its command.
+          yield* Effect.promise(() => retiring);
           const deleted = yield* Effect.forkChild(manager.deleteData(packageId));
           release();
 
@@ -906,6 +934,11 @@ export default function activate() {}
             false,
           );
         }),
+        {
+          onReconcile: (activeIds) => {
+            if (!activeIds.includes(packageId)) markRetiring();
+          },
+        },
       );
     }),
   );

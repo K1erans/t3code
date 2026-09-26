@@ -40,8 +40,12 @@ const claude = { instanceId: ProviderInstanceId.make("claudeAgent"), model: "cla
 interface Fixture {
   readonly settings?: Parameters<typeof ServerSettings.layerTest>[0];
   readonly isRepo?: boolean;
-  /** Domain events the engine publishes after the plugin subscribes. */
+  /** Domain events after the shell snapshot, numbered from 1; the event store returns them all. */
   readonly events?: ReadonlyArray<OrchestrationEvent>;
+  /** How many of `events` were published before the plugin subscribed, so only replay has them. */
+  readonly publishedBeforeSubscribe?: number;
+  /** Dispatch creates the thread, then never finishes, like a long worktree setup. */
+  readonly slowBootstrap?: boolean;
   /** Threads in the shell snapshot taken when the plugin subscribes. */
   readonly threads?: ReadonlyArray<OrchestrationThreadShell>;
   /** Thread shells as the projection holds them while the events are handled. */
@@ -53,10 +57,17 @@ const makeThreads = ({
   settings = {},
   isRepo = true,
   events = [],
+  publishedBeforeSubscribe = 0,
+  slowBootstrap = false,
   threads = [],
   projectedThreads = {},
 }: Fixture = {}) => {
   const dispatched: Array<OrchestrationCommand> = [];
+  const stored = events.map((event, index) => ({ ...event, sequence: index + 1 }));
+  let announceCreated!: (event: OrchestrationEvent) => void;
+  const threadCreated = new Promise<OrchestrationEvent>((resolve) => {
+    announceCreated = resolve;
+  });
   const layer = Layer.effect(PluginThreads.PluginThreads, PluginThreads.make).pipe(
     Layer.provide(
       Layer.mock(CommandDispatcher.CommandDispatcher)({
@@ -64,7 +75,15 @@ const makeThreads = ({
           Effect.sync(() => {
             dispatched.push(command);
             return { sequence: dispatched.length };
-          }),
+          }).pipe(
+            Effect.tap(() =>
+              slowBootstrap && command.type === "thread.turn.start"
+                ? Effect.sync(() =>
+                    announceCreated(threadEvent("thread.created", command.threadId, {})),
+                  ).pipe(Effect.andThen(Effect.never))
+                : Effect.void,
+            ),
+          ),
       }),
     ),
     Layer.provide(
@@ -84,7 +103,13 @@ const makeThreads = ({
     ),
     Layer.provide(
       Layer.mock(OrchestrationEngine.OrchestrationEngineService)({
-        subscribeDomainEvents: Effect.succeed(Stream.fromIterable(events)),
+        subscribeDomainEvents: Effect.succeed(
+          slowBootstrap
+            ? Stream.fromEffect(Effect.promise(() => threadCreated))
+            : Stream.fromIterable(stored.slice(publishedBeforeSubscribe)),
+        ),
+        readEvents: (fromSequenceExclusive) =>
+          Stream.fromIterable(stored.filter((event) => event.sequence > fromSequenceExclusive)),
       }),
     ),
     Layer.provide(
@@ -162,6 +187,18 @@ it.layer(NodeServices.layer)("plugin threads", (it) => {
       // The project defaults to the local checkout, and the plugin's title is kept.
       expect(command.bootstrap?.prepareWorktree).toBeUndefined();
       expect(command.titleSeed).toBeUndefined();
+    }),
+  );
+
+  it.effect("returns once the thread exists, without waiting for its setup", () =>
+    Effect.gen(function* () {
+      const fixture = makeThreads({
+        settings: { defaultModelSelection: codex },
+        slowBootstrap: true,
+      });
+      const thread = yield* fixture.create(input);
+      expect(thread).toMatchObject({ projectId, title: "Fix the build" });
+      expect(fixture.turnStart().threadId).toBe(thread.id);
     }),
   );
 
@@ -315,6 +352,23 @@ it.layer(NodeServices.layer)("plugin turn state changes", (it) => {
         { threadId: "stopped", projectId, state: "running" },
         { threadId: "stopped", projectId, state: "interrupted" },
         { threadId: "broken", projectId, state: "error" },
+      ]);
+    }),
+  );
+
+  it.effect("reports changes made between the snapshot and the subscription once", () =>
+    Effect.gen(function* () {
+      const fixture = makeThreads({
+        threads: [shell("early", "ready", "completed")],
+        // The turn starts before the subscription is ready and ends after it, so the
+        // store and the live stream both hold the ending.
+        events: [sessionSet("early", "running"), sessionSet("early", "ready")],
+        publishedBeforeSubscribe: 1,
+        projectedThreads: { early: shell("early", "ready", "completed") },
+      });
+      expect(yield* fixture.changes).toEqual([
+        { threadId: "early", projectId, state: "running" },
+        { threadId: "early", projectId, state: "completed" },
       ]);
     }),
   );

@@ -102,8 +102,8 @@ interface DiscoveredPackage {
 interface DiscoveryResult {
   readonly errors: ReadonlyArray<PluginPackageDiscoveryError>;
   readonly packages: ReadonlyMap<PluginPackageId, DiscoveredPackage>;
-  /** Every visible entry in `plugins/`, including folders without a readable manifest. */
-  readonly entries: ReadonlySet<string>;
+  /** Every visible folder in `plugins/`, including ones without a readable manifest. */
+  readonly folders: ReadonlySet<string>;
 }
 
 /**
@@ -767,8 +767,13 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
 
     for (const entry of [...entries].sort()) {
       if (isHiddenPluginEntry(entry)) continue;
-      visible.add(entry);
       const directory = path.join(pluginsDirectory, entry);
+      const isDirectory = yield* fileSystem.stat(directory).pipe(
+        Effect.map((info) => info.type === "Directory"),
+        Effect.orElseSucceed(() => false),
+      );
+      if (!isDirectory) continue;
+      visible.add(entry);
       const hasManifest = yield* fileSystem
         .exists(path.join(directory, MANIFEST_FILE_NAME))
         .pipe(Effect.catch(failOperation(operation)));
@@ -796,7 +801,7 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
       discovered.set(packageManifest.id, { directory, manifest: packageManifest });
     }
 
-    return { errors, packages: discovered, entries: visible } satisfies DiscoveryResult;
+    return { errors, packages: discovered, folders: visible } satisfies DiscoveryResult;
   });
 
   const loadPackage = Effect.fn("PluginPackageManager.loadPackage")(function* (
@@ -1426,7 +1431,7 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
    * countdown.
    */
   const isInstalled = (discovery: DiscoveryResult, id: PluginPackageId) =>
-    discovery.packages.has(id) || loaded.has(id) || discovery.entries.has(id);
+    discovery.packages.has(id) || loaded.has(id) || discovery.folders.has(id);
 
   /**
    * Starts the countdown for data whose plugin is no longer installed, clears it

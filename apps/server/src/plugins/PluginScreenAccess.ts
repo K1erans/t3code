@@ -117,6 +117,7 @@ export const issueScreenUrl = Effect.fn("PluginScreenAccess.issueScreenUrl")(fun
     ),
     Effect.mapError(() => unavailable),
   );
+  const expiresAt = (yield* Clock.currentTimeMillis) + TOKEN_TTL_MS;
   const payload = base64UrlEncode(
     encodeClaims({
       version: 1,
@@ -124,12 +125,13 @@ export const issueScreenUrl = Effect.fn("PluginScreenAccess.issueScreenUrl")(fun
       screenId: input.screenId,
       pluginVersion: screen.version,
       revision: screen.revision,
-      expiresAt: (yield* Clock.currentTimeMillis) + TOKEN_TTL_MS,
+      expiresAt,
     }),
   );
   const token = `${payload}.${signPayload(payload, secret)}`;
   return {
     relativeUrl: `${PLUGIN_SCREEN_ROUTE_PREFIX}/${token}/${encodeURIComponent(screen.entry)}`,
+    expiresAt,
   };
 });
 
