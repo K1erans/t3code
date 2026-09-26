@@ -1,4 +1,8 @@
-import type { PluginPackageStatus, PluginPackageStatusSnapshot } from "@t3tools/contracts";
+import type {
+  EnvironmentId,
+  PluginPackageStatus,
+  PluginPackageStatusSnapshot,
+} from "@t3tools/contracts";
 import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
@@ -49,12 +53,14 @@ function actionFailureMessage(action: PackageAction, error: unknown): string {
 }
 
 function PluginPackageRow({
+  environmentId,
   pluginPackage,
   pendingAction,
   readOnly,
   onEnabledChange,
   onReload,
 }: {
+  readonly environmentId: EnvironmentId;
   readonly pluginPackage: PluginPackageStatus;
   readonly pendingAction: PackageAction | null;
   readonly readOnly: boolean;
@@ -102,7 +108,8 @@ function PluginPackageRow({
             render={
               <Link
                 to="/settings/storage"
-                search={(previous) => previous}
+                // Plugin data is per environment, and Storage hides it in project scopes.
+                search={{ machine: environmentId }}
                 hash="storage-plugin-data"
                 hashScrollIntoView={false}
                 state={{ settingsTargetHighlight: true }}
@@ -398,6 +405,7 @@ function EnvironmentPluginsSettings({
           {visiblePackages.map((pluginPackage) => (
             <PluginPackageRow
               key={pluginPackage.id}
+              environmentId={environmentId}
               pluginPackage={pluginPackage}
               readOnly={readOnly || pending !== null}
               pendingAction={

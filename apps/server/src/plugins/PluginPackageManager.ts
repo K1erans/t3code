@@ -83,6 +83,8 @@ interface DiscoveredPackage {
 interface DiscoveryResult {
   readonly errors: ReadonlyArray<PluginPackageDiscoveryError>;
   readonly packages: ReadonlyMap<PluginPackageId, DiscoveredPackage>;
+  /** Every visible entry in `plugins/`, including folders without a readable manifest. */
+  readonly entries: ReadonlySet<string>;
 }
 
 /**
@@ -634,9 +636,11 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
       .pipe(Effect.catch(failOperation(operation)));
     const discovered = new Map<PluginPackageId, DiscoveredPackage>();
     const errors: Array<PluginPackageDiscoveryError> = [];
+    const visible = new Set<string>();
 
     for (const entry of [...entries].sort()) {
       if (isHiddenPluginEntry(entry)) continue;
+      visible.add(entry);
       const directory = path.join(pluginsDirectory, entry);
       const hasManifest = yield* fileSystem
         .exists(path.join(directory, MANIFEST_FILE_NAME))
@@ -665,7 +669,7 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
       discovered.set(packageManifest.id, { directory, manifest: packageManifest });
     }
 
-    return { errors, packages: discovered } satisfies DiscoveryResult;
+    return { errors, packages: discovered, entries: visible } satisfies DiscoveryResult;
   });
 
   const loadPackage = Effect.fn("PluginPackageManager.loadPackage")(function* (
@@ -1203,15 +1207,13 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
   };
 
   /**
-   * Whether a plugin's data still has an installed owner. A folder whose manifest
-   * fails to read keeps the data whose id matches its folder name (the name
-   * `t3 plugin install` gives it), so a typo or half-finished update never
-   * starts the countdown.
+   * Whether a plugin's data still has an installed owner. A folder named after the
+   * id (the name `t3 plugin install` gives it) counts even when its manifest is
+   * missing or unreadable, so a typo or half-finished update never starts the
+   * countdown.
    */
   const isInstalled = (discovery: DiscoveryResult, id: PluginPackageId) =>
-    discovery.packages.has(id) ||
-    loaded.has(id) ||
-    discovery.errors.some((error) => error.directory === id);
+    discovery.packages.has(id) || loaded.has(id) || discovery.entries.has(id);
 
   /**
    * Starts the countdown for data whose plugin is no longer installed, clears it

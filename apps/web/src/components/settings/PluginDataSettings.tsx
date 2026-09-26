@@ -69,9 +69,12 @@ export function PluginDataSection({
   const entries = snapshot?.entries ?? [];
   // Countdowns are whole days, so the time the page opened is precise enough.
   const [now] = useState(Date.now);
+  // Each action replaces the listing, so one runs at a time and an older result never
+  // brings back a row a delete just removed.
+  const busy = calculating || deleting;
 
   const runCalculate = () => {
-    if (calculating) return;
+    if (busy) return;
     setCalculating(true);
     void (async () => {
       const result = await calculateSizes({ environmentId, input: {} });
@@ -94,7 +97,7 @@ export function PluginDataSection({
   };
 
   const runDelete = (entry: PluginDataEntry) => {
-    if (deleting || readOnly) return;
+    if (busy || readOnly) return;
     setDeleting(true);
     void (async () => {
       const result = await deleteData({ environmentId, input: { id: entry.id } });
@@ -122,13 +125,7 @@ export function PluginDataSection({
       {...searchableSetting("storage-plugin-data")}
       headerAction={
         entries.length > 0 ? (
-          <Button
-            type="button"
-            size="xs"
-            variant="outline"
-            disabled={calculating}
-            onClick={runCalculate}
-          >
+          <Button type="button" size="xs" variant="outline" disabled={busy} onClick={runCalculate}>
             {calculating ? <Spinner className="size-3" /> : null}
             Calculate sizes
           </Button>
@@ -200,7 +197,7 @@ export function PluginDataSection({
                     type="button"
                     size="xs"
                     variant="destructive-outline"
-                    disabled={readOnly || deleting}
+                    disabled={readOnly || busy}
                     onClick={() => setConfirming(entry)}
                   >
                     Delete data
@@ -234,7 +231,7 @@ export function PluginDataSection({
             </AlertDialogClose>
             <Button
               variant="destructive"
-              disabled={deleting || confirming === null}
+              disabled={busy || confirming === null}
               onClick={() => {
                 if (confirming !== null) runDelete(confirming);
               }}

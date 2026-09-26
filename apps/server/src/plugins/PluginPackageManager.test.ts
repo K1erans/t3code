@@ -670,12 +670,20 @@ export default function activate() {}
       const now = Duration.toMillis(Duration.days(100));
       const retention = Duration.toMillis(PluginPackageManager.PLUGIN_DATA_RETENTION);
       yield* TestClock.setTime(now);
-      for (const id of ["com.acme.expired", "com.acme.recent", "com.acme.broken"]) {
+      for (const id of [
+        "com.acme.expired",
+        "com.acme.recent",
+        "com.acme.broken",
+        "com.acme.bare",
+      ]) {
         yield* fileSystem.makeDirectory(`${baseDir}/userdata/plugin-data/${id}`, {
           recursive: true,
         });
       }
-      // A plugin whose manifest no longer reads is still installed, so its data stays.
+      // A plugin whose manifest is unreadable or missing is still installed, so its data stays.
+      yield* fileSystem.makeDirectory(`${baseDir}/userdata/plugins/com.acme.bare`, {
+        recursive: true,
+      });
       yield* fileSystem.makeDirectory(`${baseDir}/userdata/plugins/com.acme.broken`, {
         recursive: true,
       });
@@ -692,6 +700,7 @@ export default function activate() {}
             "com.acme.recent": now - retention + 1,
             "com.acme.gone": now - 1,
             "com.acme.broken": now - retention,
+            "com.acme.bare": now - retention,
           },
         }),
       );
@@ -707,9 +716,9 @@ export default function activate() {}
       expect(yield* fileSystem.exists(`${baseDir}/userdata/plugin-data/com.acme.recent`)).toBe(
         true,
       );
-      expect(yield* fileSystem.exists(`${baseDir}/userdata/plugin-data/com.acme.broken`)).toBe(
-        true,
-      );
+      for (const id of ["com.acme.broken", "com.acme.bare"]) {
+        expect(yield* fileSystem.exists(`${baseDir}/userdata/plugin-data/${id}`)).toBe(true);
+      }
       // Entries whose folder is gone or whose plugin is back are dropped along with the expired one.
       expect((yield* readPluginState(baseDir)).missingSince).toEqual({
         "com.acme.recent": now - retention + 1,
@@ -760,6 +769,73 @@ export default function activate() {}
           expect(again._tag === "Failure" && Cause.squash(again.cause)).toMatchObject({
             _tag: "PluginPackageNotFoundError",
           });
+        }),
+      );
+    }),
+  );
+
+  it.effect("deletes a removed plugin's data only after its running command finishes", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const baseDir = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3code-plugin-data-running-test-",
+      });
+      const gateSymbol = `t3.test.plugin.data-running.${baseDir}`;
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let markStarted!: () => void;
+      const commandStarted = new Promise<void>((resolve) => {
+        markStarted = resolve;
+      });
+      yield* Effect.acquireRelease(
+        Effect.sync(() =>
+          Reflect.set(globalThis, Symbol.for(gateSymbol), { started: markStarted, released }),
+        ),
+        () => Effect.sync(() => Reflect.deleteProperty(globalThis, Symbol.for(gateSymbol))),
+      );
+      const packageDirectory = yield* writePackage(
+        baseDir,
+        packageId,
+        commandId,
+        `export default function activate(api) {
+  api.registerCommand("${commandId}", async () => {
+    const gate = globalThis[Symbol.for(${encodeJsonString(gateSymbol)})];
+    gate.started();
+    await gate.released;
+    await api.storage.set("last", "written after removal");
+    return { message: "stored", tone: "success" };
+  });
+}
+`,
+      );
+
+      yield* useEnvironment(
+        baseDir,
+        Effect.gen(function* () {
+          const manager = yield* PluginPackageManager.PluginPackageManager;
+          const catalog = yield* PluginCommandCatalog.PluginCommandCatalog;
+          yield* manager.enable(packageId);
+          const listed = yield* catalog.list;
+          const invoked = yield* Effect.forkChild(
+            manager.invokeCommand({ generation: listed.generation, id: commandId }),
+          );
+          yield* Effect.promise(() => commandStarted);
+
+          // The rescan retiring the removed plugin holds the lock until the command
+          // finishes, so the delete queued behind it never closes a store in use.
+          yield* fileSystem.remove(packageDirectory, { recursive: true });
+          const rescanned = yield* Effect.forkChild(manager.rescan);
+          const deleted = yield* Effect.forkChild(manager.deleteData(packageId));
+          release();
+
+          expect(yield* Fiber.join(invoked)).toEqual({ message: "stored", tone: "success" });
+          yield* Fiber.join(rescanned);
+          expect((yield* Fiber.join(deleted)).entries).toEqual([]);
+          expect(yield* fileSystem.exists(`${baseDir}/userdata/plugin-data/${packageId}`)).toBe(
+            false,
+          );
         }),
       );
     }),

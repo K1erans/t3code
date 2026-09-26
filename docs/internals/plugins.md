@@ -64,9 +64,10 @@ when they are listed.
 
 `plugin-data/<id>/` is never touched by disable, reload or reinstall. Only two things remove it:
 Delete data in Settings → Storage, and the rescan sweep once the id has been missing for 30 days
-(`missingSince` in `plugins.json`). "Missing" means no discovered package and no loaded version, and
-a folder named after the id whose manifest fails to read counts as installed, so a typo or a
-half-finished update can never start the countdown.
+(`missingSince` in `plugins.json`). "Missing" means no discovered package, no loaded version and no
+folder in `plugins/` named after the id, so a missing or broken manifest never starts the countdown.
+Deleting takes the manager lock, and a rescan retiring a removed plugin holds it until the plugin's
+running commands finish, so a store is never closed under a command.
 
 ## Mobile in v0
 
