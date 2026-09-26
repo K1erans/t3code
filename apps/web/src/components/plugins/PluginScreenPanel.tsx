@@ -40,6 +40,8 @@ import { pluginActionErrorText } from "../settings/PluginsSettings.logic";
 
 /** How long before its token expires an open screen fetches a new URL. */
 const URL_RENEW_MARGIN_MS = 10 * 60 * 1000;
+/** How soon a failed URL renewal is retried. */
+const URL_RENEW_RETRY_MS = 60 * 1000;
 
 interface PluginScreenPanelProps {
   readonly environmentId: EnvironmentId;
@@ -92,13 +94,22 @@ function PluginScreenFrame(props: {
   });
   const minted = useAtomValue(urlAtom);
   const refreshUrl = useAtomRefresh(urlAtom);
-  // The URL's token expires; an open screen gets a new one shortly before, which reloads it.
-  const expiresAt = minted._tag === "Success" ? minted.value.expiresAt : undefined;
+  // A failed renewal keeps the last URL, which stays valid until its token expires.
+  const current = Option.getOrUndefined(AsyncResult.value(minted));
+  const renewalFailed = minted._tag === "Failure" && current !== undefined;
+  // The URL's token expires; an open screen gets a new one shortly before, which reloads it,
+  // and retries a failed renewal.
+  const expiresAt = current?.expiresAt;
   useEffect(() => {
-    if (expiresAt === undefined) return;
-    const timer = setTimeout(refreshUrl, Math.max(0, expiresAt - Date.now() - URL_RENEW_MARGIN_MS));
+    const delay = renewalFailed
+      ? URL_RENEW_RETRY_MS
+      : expiresAt === undefined
+        ? undefined
+        : Math.max(0, expiresAt - Date.now() - URL_RENEW_MARGIN_MS);
+    if (delay === undefined) return;
+    const timer = setTimeout(refreshUrl, delay);
     return () => clearTimeout(timer);
-  }, [expiresAt, refreshUrl]);
+  }, [expiresAt, renewalFailed, refreshUrl]);
   const { resolvedTheme } = useTheme();
   const frameRef = useRef<HTMLIFrameElement>(null);
   const context = {
@@ -123,7 +134,7 @@ function PluginScreenFrame(props: {
     return () => window.removeEventListener("message", onMessage);
   }, []);
 
-  if (minted._tag === "Failure") {
+  if (current === undefined && minted._tag === "Failure") {
     return (
       <PluginScreenNotice
         title={`Could not open ${screen.title}`}
@@ -132,8 +143,8 @@ function PluginScreenFrame(props: {
     );
   }
   const url =
-    minted._tag === "Success" && connection._tag === "Some"
-      ? resolveAssetUrl(connection.value.httpBaseUrl, minted.value.relativeUrl)
+    current !== undefined && connection._tag === "Some"
+      ? resolveAssetUrl(connection.value.httpBaseUrl, current.relativeUrl)
       : null;
   if (url === null) return null;
   return (
