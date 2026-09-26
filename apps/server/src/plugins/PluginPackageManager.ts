@@ -6,6 +6,8 @@ import {
   PluginCommandInvocationError,
   PluginCommandInvocationResult,
   type PluginCommandInvokeInput,
+  type PluginDataEntry,
+  type PluginDataSnapshot,
   PluginPackageId,
   PluginPackageNotFoundError,
   PluginPackageOperationError,
@@ -19,6 +21,7 @@ import type { PluginManifest } from "@t3tools/plugin-runtime/manifest";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
+import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -69,6 +72,8 @@ const DEFAULT_COMMAND_SURFACES: PluginCommand["surfaces"] = ["web", "desktop"];
 export const IDLE_TIMEOUT = Duration.minutes(10);
 /** How often active plugins are checked against `IDLE_TIMEOUT`. */
 export const IDLE_CHECK_INTERVAL = Duration.minutes(1);
+/** How long a removed plugin's data is kept in case it comes back. */
+export const PLUGIN_DATA_RETENTION = Duration.days(30);
 
 interface DiscoveredPackage {
   readonly directory: string;
@@ -181,13 +186,19 @@ const failureReason = (entryPoint: string, outcome: EntryPointOutcome, error: un
 };
 
 const PluginStateJson = Schema.fromJsonString(
-  Schema.Struct({ enabled: Schema.Array(PluginPackageId) }),
+  Schema.Struct({
+    enabled: Schema.Array(PluginPackageId),
+    /** When each leftover's plugin was first noticed missing, in epoch milliseconds. */
+    missingSince: Schema.optional(Schema.Record(Schema.String, Schema.Number)),
+  }),
 );
+type PluginState = typeof PluginStateJson.Type;
 const decodePluginStateJson = Schema.decodeUnknownEffect(PluginStateJson);
 const encodePluginStateJson = Schema.encodeEffect(PluginStateJson);
 const decodeInvocationResult = Schema.decodeUnknownEffect(PluginCommandInvocationResult);
 const isPluginPackageOperationError = Schema.is(PluginPackageOperationError);
 const isPluginEntryPointError = Schema.is(PluginEntryPointError);
+const isPluginPackageId = Schema.is(PluginPackageId);
 
 const detailFromUnknown = (error: unknown): string => {
   if (isPluginEntryPointError(error)) return error.reason;
@@ -330,6 +341,17 @@ export class PluginPackageManager extends Context.Service<
      * loaded or last failed to load. New packages simply appear disabled.
      */
     readonly rescan: Effect.Effect<PluginPackageStatusSnapshot, PluginPackageOperationError>;
+    /** Every folder in `plugin-data/`, installed or not, without sizes. */
+    readonly data: Effect.Effect<PluginDataSnapshot, PluginPackageOperationError>;
+    /** `data` with each folder's size, which walks every file. */
+    readonly dataSizes: Effect.Effect<PluginDataSnapshot, PluginPackageOperationError>;
+    /** Deletes the data of a plugin that is no longer installed. */
+    readonly deleteData: (
+      id: PluginPackageId,
+    ) => Effect.Effect<
+      PluginDataSnapshot,
+      PluginPackageNotFoundError | PluginPackageOperationError
+    >;
   }
 >()("t3/plugins/PluginPackageManager") {}
 
@@ -385,13 +407,18 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
   const semaphore = yield* Semaphore.make(1);
   const pluginsDirectory = path.join(config.stateDir, "plugins");
   const pluginCacheDirectory = path.join(config.stateDir, "plugin-cache");
-  // Plugin data outlives disable, reload and restarts; nothing here ever deletes it.
+  // Plugin data outlives disable, reload and restarts. Only a rescan that finds it
+  // left over for `PLUGIN_DATA_RETENTION`, or Delete data, removes it.
   const pluginDataDirectory = path.join(config.stateDir, "plugin-data");
   // Created before the shutdown finalizer below, so stores close after plugins retire.
   const storageScope = yield* Scope.make();
   yield* Effect.addFinalizer((exit) => Scope.close(storageScope, exit));
   // One store per plugin id, shared across reloads so update serialization spans generations.
-  const openStores = new Map<PluginPackageId, PluginDataAccess>();
+  // Each has its own scope so deleting a leftover's data can close its database first.
+  const openStores = new Map<
+    PluginPackageId,
+    { readonly access: PluginDataAccess; readonly scope: Scope.Closeable }
+  >();
   const pluginStatePath = path.join(config.stateDir, PLUGIN_STATE_FILE_NAME);
   const loaded = new Map<PluginPackageId, LoadedPlugin>();
   const active = new Map<PluginPackageId, ActivePlugin>();
@@ -483,18 +510,62 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
     operation: PluginPackageOperation,
   ) {
     const existing = openStores.get(id);
-    if (existing !== undefined) return existing;
+    if (existing !== undefined) return existing.access;
     const dataDir = path.join(pluginDataDirectory, id);
+    const scope = yield* Scope.fork(storageScope);
     const storage = yield* PluginStorage.open(dataDir).pipe(
-      Scope.provide(storageScope),
+      Scope.provide(scope),
       Effect.provideService(FileSystem.FileSystem, fileSystem),
       Effect.provideService(Path.Path, path),
+      Effect.onError(() => Scope.close(scope, Exit.void)),
       Effect.catch(failOperation(operation, id)),
     );
     const access = { dataDir, storage } satisfies PluginDataAccess;
-    openStores.set(id, access);
+    openStores.set(id, { access, scope });
     return access;
   });
+
+  /** Ids with a folder in `plugin-data/`. */
+  const listDataIds = (operation: PluginPackageOperation) =>
+    Effect.gen(function* () {
+      if (!(yield* fileSystem.exists(pluginDataDirectory))) return [];
+      const ids: Array<PluginPackageId> = [];
+      for (const entry of [...(yield* fileSystem.readDirectory(pluginDataDirectory))].sort()) {
+        if (!isPluginPackageId(entry)) continue;
+        const isDirectory = yield* fileSystem.stat(path.join(pluginDataDirectory, entry)).pipe(
+          Effect.map((info) => info.type === "Directory"),
+          Effect.orElseSucceed(() => false),
+        );
+        if (isDirectory) ids.push(entry);
+      }
+      return ids;
+    }).pipe(Effect.catch(failOperation(operation)));
+
+  /** Closes the plugin's store if it is open, then deletes its data folder. */
+  const removeData = Effect.fnUntraced(function* (
+    id: PluginPackageId,
+    operation: PluginPackageOperation,
+  ) {
+    const open = openStores.get(id);
+    if (open !== undefined) {
+      openStores.delete(id);
+      yield* Scope.close(open.scope, Exit.void);
+    }
+    yield* fileSystem
+      .remove(path.join(pluginDataDirectory, id), { recursive: true, force: true })
+      .pipe(Effect.catch(failOperation(operation, id)));
+  });
+
+  /** Total bytes of the files under `directory`; unreadable entries count as empty. */
+  const directorySize = (directory: string) =>
+    Effect.gen(function* () {
+      let total = 0;
+      for (const entry of yield* fileSystem.readDirectory(directory, { recursive: true })) {
+        const info = yield* Effect.option(fileSystem.stat(path.join(directory, entry)));
+        if (Option.isSome(info) && info.value.type === "File") total += Number(info.value.size);
+      }
+      return total;
+    }).pipe(Effect.orElseSucceed(() => 0));
 
   // Every file's path, size, mtime and inode: in-place edits change the mtime,
   // and a replaced folder has new inodes even when a copy preserves timestamps.
@@ -746,27 +817,43 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
     }
   });
 
-  const readEnabledIds = (operation: PluginPackageOperation, id?: PluginPackageId) =>
+  const readState = (operation: PluginPackageOperation, id?: PluginPackageId) =>
     Effect.gen(function* () {
-      if (!(yield* fileSystem.exists(pluginStatePath))) return new Set<PluginPackageId>();
-      const state = yield* fileSystem
+      if (!(yield* fileSystem.exists(pluginStatePath))) return { enabled: [] } as PluginState;
+      return yield* fileSystem
         .readFileString(pluginStatePath)
         .pipe(Effect.flatMap(decodePluginStateJson));
-      return new Set<PluginPackageId>(state.enabled);
     }).pipe(Effect.catch(failOperation(operation, id)));
 
-  const persistEnabledIds = (
-    ids: ReadonlySet<PluginPackageId>,
+  const readEnabledIds = (operation: PluginPackageOperation, id?: PluginPackageId) =>
+    readState(operation, id).pipe(Effect.map((state) => new Set<PluginPackageId>(state.enabled)));
+
+  const writeState = (
+    state: PluginState,
     operation: PluginPackageOperation,
-    id: PluginPackageId,
+    id?: PluginPackageId,
   ) =>
-    encodePluginStateJson({ enabled: [...ids].sort() }).pipe(
+    encodePluginStateJson({
+      enabled: [...state.enabled].sort(),
+      ...(Object.keys(state.missingSince ?? {}).length === 0
+        ? {}
+        : { missingSince: state.missingSince }),
+    }).pipe(
       Effect.flatMap((contents) =>
         writeFileStringAtomically({ filePath: pluginStatePath, contents: `${contents}\n` }),
       ),
       Effect.provideService(FileSystem.FileSystem, fileSystem),
       Effect.provideService(Path.Path, path),
       Effect.catch(failOperation(operation, id)),
+    );
+
+  const persistEnabledIds = (
+    ids: ReadonlySet<PluginPackageId>,
+    operation: PluginPackageOperation,
+    id: PluginPackageId,
+  ) =>
+    readState(operation, id).pipe(
+      Effect.flatMap((state) => writeState({ ...state, enabled: [...ids] }, operation, id)),
     );
 
   /** Puts the enabled set back after a change the runtime rolled back. */
@@ -1115,6 +1202,99 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
     return definition !== undefined && failedCommands.has(definition) ? definition : undefined;
   };
 
+  /**
+   * Whether a plugin's data still has an installed owner. A folder whose manifest
+   * fails to read keeps the data whose id matches its folder name (the name
+   * `t3 plugin install` gives it), so a typo or half-finished update never
+   * starts the countdown.
+   */
+  const isInstalled = (discovery: DiscoveryResult, id: PluginPackageId) =>
+    discovery.packages.has(id) ||
+    loaded.has(id) ||
+    discovery.errors.some((error) => error.directory === id);
+
+  /**
+   * Starts the countdown for data whose plugin is no longer installed, clears it
+   * for reinstalled plugins, and deletes data whose countdown has run out.
+   */
+  const sweepPluginData = Effect.fnUntraced(function* (discovery: DiscoveryResult) {
+    const now = yield* Clock.currentTimeMillis;
+    const state = yield* readState("rescan");
+    const previous = state.missingSince ?? {};
+    const missingSince: Record<string, number> = {};
+    for (const id of yield* listDataIds("rescan")) {
+      if (isInstalled(discovery, id)) continue;
+      const since = previous[id] ?? now;
+      if (now - since >= Duration.toMillis(PLUGIN_DATA_RETENTION)) {
+        const removed = yield* Effect.exit(removeData(id, "rescan"));
+        if (Exit.isSuccess(removed)) continue;
+        yield* Effect.logWarning("Failed to delete leftover plugin data", {
+          id,
+          detail: detailFromCause(removed.cause),
+        });
+      }
+      missingSince[id] = since;
+    }
+    const unchanged =
+      Object.keys(previous).length === Object.keys(missingSince).length &&
+      Object.entries(missingSince).every(([id, since]) => previous[id] === since);
+    if (!unchanged) yield* writeState({ ...state, missingSince }, "rescan");
+  });
+
+  const dataSnapshot = Effect.fn("PluginPackageManager.dataSnapshot")(function* (
+    operation: PluginPackageOperation,
+    withSizes: boolean,
+  ): Effect.fn.Return<PluginDataSnapshot, PluginPackageOperationError> {
+    const [discovery, state, ids] = yield* Effect.all(
+      [discover(operation), readState(operation), listDataIds(operation)],
+      { concurrency: "unbounded" },
+    );
+    const entries: Array<PluginDataEntry> = [];
+    for (const id of ids) {
+      const packageManifest = loaded.get(id)?.manifest ?? discovery.packages.get(id)?.manifest;
+      const name = packageManifest?.name.trim();
+      const installed = isInstalled(discovery, id);
+      const since = installed ? undefined : state.missingSince?.[id];
+      entries.push({
+        id,
+        ...(name ? { name } : {}),
+        installed,
+        ...(since === undefined
+          ? {}
+          : {
+              deletesAt: DateTime.formatIso(
+                DateTime.makeUnsafe(since + Duration.toMillis(PLUGIN_DATA_RETENTION)),
+              ),
+            }),
+        ...(withSizes
+          ? { sizeBytes: yield* directorySize(path.join(pluginDataDirectory, id)) }
+          : {}),
+      });
+    }
+    return { entries };
+  });
+
+  const deleteData = Effect.fn("PluginPackageManager.deleteData")(function* (id: PluginPackageId) {
+    const discovery = yield* discover("deleteData");
+    if (isInstalled(discovery, id)) {
+      return yield* operationError(
+        "deleteData",
+        "The plugin is still installed. Remove it before deleting its data.",
+        id,
+      );
+    }
+    if (!(yield* listDataIds("deleteData")).includes(id)) {
+      return yield* new PluginPackageNotFoundError({ id });
+    }
+    yield* removeData(id, "deleteData");
+    const state = yield* readState("deleteData", id);
+    if (state.missingSince?.[id] !== undefined) {
+      const { [id]: _deleted, ...missingSince } = state.missingSince;
+      yield* writeState({ ...state, missingSince }, "deleteData", id);
+    }
+    return yield* dataSnapshot("deleteData", false);
+  });
+
   const rescanUnlocked = Effect.fn("PluginPackageManager.rescan")(function* () {
     const discovery = yield* discover("rescan");
     const enabledIds = yield* readEnabledIds("rescan");
@@ -1162,6 +1342,7 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
         });
       }
     }
+    yield* sweepPluginData(discovery);
     return yield* status("rescan");
   });
 
@@ -1282,6 +1463,9 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
     disable: (id: PluginPackageId) => semaphore.withPermits(1)(disable(id)),
     reload: (id: PluginPackageId) => semaphore.withPermits(1)(transition("reload", id)),
     rescan,
+    data: dataSnapshot("data", false),
+    dataSizes: dataSnapshot("data", true),
+    deleteData: (id: PluginPackageId) => semaphore.withPermits(1)(deleteData(id)),
   } as const;
 });
 
@@ -1330,6 +1514,9 @@ const unavailableService = (
     disable: () => Effect.fail(error),
     reload: () => Effect.fail(error),
     rescan: Effect.fail(error),
+    data: Effect.fail(error),
+    dataSizes: Effect.fail(error),
+    deleteData: () => Effect.fail(error),
   });
 
 export const layerWith = (options: PluginPackageManagerOptions = {}) =>

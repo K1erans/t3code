@@ -5,6 +5,7 @@ import { PluginPackageOperationError } from "@t3tools/contracts";
 import {
   filterPluginPackages,
   pluginActionErrorText,
+  pluginDataDeletionLabel,
   pluginStatusBadges,
 } from "./PluginsSettings.logic";
 
@@ -74,5 +75,21 @@ describe("pluginActionErrorText", () => {
     );
     expect(pluginActionErrorText(new Error("  "))).toBeNull();
     expect(pluginActionErrorText("boom")).toBeNull();
+  });
+});
+
+describe("pluginDataDeletionLabel", () => {
+  const now = Date.parse("2026-09-01T12:00:00.000Z");
+  const inDays = (days: number) => new Date(now + days * 24 * 60 * 60 * 1000).toISOString();
+
+  it("counts whole days, rounding a partial day up", () => {
+    expect(pluginDataDeletionLabel(inDays(30), now)).toBe("Deletes in 30 days");
+    expect(pluginDataDeletionLabel(inDays(1.5), now)).toBe("Deletes in 2 days");
+    expect(pluginDataDeletionLabel(inDays(0.25), now)).toBe("Deletes in 1 day");
+  });
+
+  it("says an expired countdown waits for the next rescan", () => {
+    expect(pluginDataDeletionLabel(inDays(0), now)).toBe("Deletes on the next rescan");
+    expect(pluginDataDeletionLabel(inDays(-2), now)).toBe("Deletes on the next rescan");
   });
 });

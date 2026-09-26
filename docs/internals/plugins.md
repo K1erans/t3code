@@ -27,8 +27,9 @@ change means a new major, and the old one stays working until the version record
 
 ## Commands run outside every lock
 
-The runtime serializes reconcile and dispose, and the manager serializes enable, disable, reload
-and rescan. Command invocations and `pluginPackages.status` take neither lock. A command can run for
+The runtime serializes reconcile and dispose, and the manager serializes enable, disable, reload,
+rescan and deleting plugin data. Command invocations and the status and data listings take neither
+lock. A command can run for
 up to the entry point timeout, and holding a lock that long would stall every other command, every
 lifecycle action and every client's Settings, including remote and mobile ones.
 
@@ -58,6 +59,14 @@ appear and the catalog generation clients hold changes only when the listed comm
 Activation and idle shutdown never invalidate an open palette. The runtime's own generation is
 internal, and command ids must be unique across enabled plugins because nothing is registered yet
 when they are listed.
+
+## Plugin data outlives its plugin
+
+`plugin-data/<id>/` is never touched by disable, reload or reinstall. Only two things remove it:
+Delete data in Settings → Storage, and the rescan sweep once the id has been missing for 30 days
+(`missingSince` in `plugins.json`). "Missing" means no discovered package and no loaded version, and
+a folder named after the id whose manifest fails to read counts as installed, so a typo or a
+half-finished update can never start the countdown.
 
 ## Mobile in v0
 

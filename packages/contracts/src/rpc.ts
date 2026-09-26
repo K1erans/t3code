@@ -116,6 +116,7 @@ import {
   PluginCommandNotFoundError,
 } from "./pluginCommands.ts";
 import {
+  PluginDataSnapshot,
   PluginPackageActionInput,
   PluginPackageNotFoundError,
   PluginPackageOperationError,
@@ -410,6 +411,9 @@ export const WS_METHODS = {
   pluginPackagesDisable: "pluginPackages.disable",
   pluginPackagesReload: "pluginPackages.reload",
   pluginPackagesRescan: "pluginPackages.rescan",
+  pluginPackagesData: "pluginPackages.data",
+  pluginPackagesDataSizes: "pluginPackages.dataSizes",
+  pluginPackagesDeleteData: "pluginPackages.deleteData",
 
   // Cloud environment methods
   cloudGetRelayClientStatus: "cloud.getRelayClientStatus",
@@ -537,6 +541,28 @@ export const WsPluginPackagesRescanRpc = Rpc.make(WS_METHODS.pluginPackagesResca
   payload: Schema.Struct({}),
   success: PluginPackageStatusSnapshot,
   error: Schema.Union([PluginPackageOperationError, EnvironmentAuthorizationError]),
+});
+
+export const WsPluginPackagesDataRpc = Rpc.make(WS_METHODS.pluginPackagesData, {
+  payload: Schema.Struct({}),
+  success: PluginDataSnapshot,
+  error: Schema.Union([PluginPackageOperationError, EnvironmentAuthorizationError]),
+});
+
+export const WsPluginPackagesDataSizesRpc = Rpc.make(WS_METHODS.pluginPackagesDataSizes, {
+  payload: Schema.Struct({}),
+  success: PluginDataSnapshot,
+  error: Schema.Union([PluginPackageOperationError, EnvironmentAuthorizationError]),
+});
+
+export const WsPluginPackagesDeleteDataRpc = Rpc.make(WS_METHODS.pluginPackagesDeleteData, {
+  payload: PluginPackageActionInput,
+  success: PluginDataSnapshot,
+  error: Schema.Union([
+    PluginPackageNotFoundError,
+    PluginPackageOperationError,
+    EnvironmentAuthorizationError,
+  ]),
 });
 
 const WsServerRefreshProvidersRpc = Rpc.make(WS_METHODS.serverRefreshProviders, {
@@ -1478,6 +1504,9 @@ export const WsRpcGroup = RpcGroup.make(
   WsPluginPackagesDisableRpc,
   WsPluginPackagesReloadRpc,
   WsPluginPackagesRescanRpc,
+  WsPluginPackagesDataRpc,
+  WsPluginPackagesDataSizesRpc,
+  WsPluginPackagesDeleteDataRpc,
   WsServerRefreshProvidersRpc,
   WsServerUpdateProviderRpc,
   WsProviderConsumeResetCreditRpc,

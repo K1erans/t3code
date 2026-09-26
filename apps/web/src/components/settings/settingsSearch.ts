@@ -148,6 +148,13 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["disk storage browser screenshots captures rotated logs cleanup retention"],
   },
   {
+    id: "storage-plugin-data",
+    title: "Plugin data",
+    to: "/settings/storage",
+    scope: "environment-defaults",
+    searchTerms: ["plugins storage leftover removed uninstalled delete size disk manage data"],
+  },
+  {
     id: "project-defaults",
     title: "Project defaults and overrides",
     to: "/settings/general",

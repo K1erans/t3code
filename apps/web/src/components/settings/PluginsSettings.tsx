@@ -12,6 +12,7 @@ import {
   SearchIcon,
   ShieldAlertIcon,
 } from "lucide-react";
+import { Link } from "@tanstack/react-router";
 import { useCallback, useMemo, useState } from "react";
 
 import type { EnvironmentPresentation } from "../../state/environments";
@@ -97,6 +98,21 @@ function PluginPackageRow({
       className="border border-border/60 bg-card/35"
       control={
         <div className="flex items-center gap-2">
+          <Button
+            render={
+              <Link
+                to="/settings/storage"
+                search={(previous) => previous}
+                hash="storage-plugin-data"
+                hashScrollIntoView={false}
+                state={{ settingsTargetHighlight: true }}
+              />
+            }
+            size="xs"
+            variant="ghost-muted"
+          >
+            Manage data
+          </Button>
           {pluginPackage.enabled ? (
             <Button
               type="button"
