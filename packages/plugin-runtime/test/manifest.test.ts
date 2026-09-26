@@ -97,6 +97,27 @@ describe("PluginManifest", () => {
     ).toThrow();
   });
 
+  it("accepts panel screens with an HTML entry inside the package", () => {
+    const screen = {
+      id: "board",
+      title: "Task board",
+      entry: "./dist/screen/index.html",
+      placement: "panel",
+      scope: "project",
+    };
+    const withScreens = (screens: ReadonlyArray<unknown>) =>
+      decodeManifest({ ...validManifest, contributes: { screens } });
+    expect(withScreens([screen]).contributes?.screens).toEqual([screen]);
+    expect(withScreens([{ ...screen, scope: "environment" }])).toBeDefined();
+    expect(() => withScreens([{ ...screen, placement: "sidebar" }])).toThrow();
+    expect(() => withScreens([{ ...screen, scope: "thread" }])).toThrow();
+    expect(() => withScreens([{ ...screen, entry: "./dist/screen.js" }])).toThrow();
+    expect(() => withScreens([{ ...screen, entry: "./../index.html" }])).toThrow();
+    expect(() => withScreens([{ ...screen, id: "Board" }])).toThrow();
+    expect(() => withScreens([{ ...screen, title: " " }])).toThrow();
+    expect(() => withScreens([screen, { ...screen, title: "Again" }])).toThrow();
+  });
+
   it("rejects malformed versions and capability ids", () => {
     expect(() => decodeManifest({ ...validManifest, version: "next" })).toThrow();
     expect(() => decodeManifest({ ...validManifest, version: "01.2.3" })).toThrow();

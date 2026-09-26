@@ -53,11 +53,24 @@ is disposed and the next command activates the same loaded code again, since re-
 leak a module copy each time. Enable and Reload activate at once so a broken `activate` shows
 immediately and a failed reload keeps the previous version live.
 
-The palette lists commands from manifests, not from registrations, so an idle plugin's commands
-appear and the catalog generation clients hold changes only when the listed commands do.
+The palette lists commands and screens from manifests, not from registrations, so an idle plugin's
+commands appear and the catalog generation clients hold changes only when the listed commands or
+screens do. A screen carries its load revision, so a reload changes the generation too.
 Activation and idle shutdown never invalidate an open palette. The runtime's own generation is
 internal, and command ids must be unique across enabled plugins because nothing is registered yet
 when they are listed.
+
+## Screens are authorized by their URL
+
+A remote client authenticates each request with headers an `<iframe src>` cannot send, and a cookie
+on the environment would be a blocked third-party cookie there. So a screen loads from a signed
+`/api/plugins/<token>/…` URL minted over the WebSocket, like HTML previews in
+[`AssetAccess`](../../apps/server/src/assets/AssetAccess.ts). The token names a plugin screen and
+the load revision it was minted for; every request re-checks both against the loaded plugin, so a
+disable or reload revokes URLs already handed out. In Vite dev and `npx t3` the environment is the
+app's own origin, which is why screens must never get `allow-same-origin`: the CSP `sandbox` header
+and the iframe attribute both give them an opaque origin. Screens are static files and never
+activate their plugin.
 
 ## Mobile in v0
 

@@ -57,6 +57,30 @@ const CommandContributions = Schema.Array(CommandContribution).check(
   }),
 );
 
+/**
+ * A sandboxed page the host frames. `entry` is the package-relative HTML file; the host
+ * serves its folder, so relative scripts, styles and images beside it load too. A panel
+ * screen opens as a right-panel tab beside a thread; its project is that thread's.
+ */
+const ScreenContribution = ClosedStruct({
+  id: Schema.String.check(Schema.isPattern(/^[a-z0-9][a-z0-9-]*$/), Schema.isMaxLength(64)),
+  title: Schema.String.check(Schema.isPattern(/\S/), Schema.isMaxLength(80)),
+  entry: RelativeEntrypoint.check(Schema.isPattern(/\.html?$/i)),
+  placement: Schema.Literal("panel"),
+  scope: Schema.Literals(["project", "environment"]),
+});
+
+const ScreenContributions = Schema.Array(ScreenContribution).check(
+  Schema.makeFilter((screens) => {
+    const ids = new Set<string>();
+    for (const screen of screens) {
+      if (ids.has(screen.id)) return `Duplicate screen id ${screen.id}`;
+      ids.add(screen.id);
+    }
+    return undefined;
+  }),
+);
+
 export const PluginManifest = ClosedStruct({
   manifestVersion: Schema.Literal(1),
   id: NamespacedId,
@@ -74,7 +98,12 @@ export const PluginManifest = ClosedStruct({
    */
   activationEvents: Schema.optional(Schema.Array(Schema.Literal("onStartup"))),
   entrypoints: Schema.optional(ClosedStruct({ server: Schema.optional(RelativeEntrypoint) })),
-  contributes: Schema.optional(ClosedStruct({ commands: Schema.optional(CommandContributions) })),
+  contributes: Schema.optional(
+    ClosedStruct({
+      commands: Schema.optional(CommandContributions),
+      screens: Schema.optional(ScreenContributions),
+    }),
+  ),
 });
 
 export type PluginManifest = typeof PluginManifest.Type;

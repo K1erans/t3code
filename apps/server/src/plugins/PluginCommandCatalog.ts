@@ -7,6 +7,7 @@ import {
   PluginCommandInvocationError,
   type PluginCommandInvokeInput,
   PluginCommandNotFoundError,
+  type PluginScreen,
 } from "@t3tools/contracts";
 import type { PluginActivationContext, PluginDefinition } from "@t3tools/plugin-runtime";
 import { PluginRuntime } from "@t3tools/plugin-runtime";
@@ -59,17 +60,26 @@ const sameCommands = (left: ReadonlyArray<PluginCommand>, right: ReadonlyArray<P
     );
   });
 
+const freezeScreen = (screen: PluginScreen): PluginScreen =>
+  Object.freeze({ ...screen, surfaces: Object.freeze([...screen.surfaces]) });
+
+// Screens are few and flat, so comparing their JSON is exact and cheap.
+const sameScreens = (left: ReadonlyArray<PluginScreen>, right: ReadonlyArray<PluginScreen>) =>
+  JSON.stringify(left) === JSON.stringify(right);
+
 export class PluginCommandCatalog extends Context.Service<
   PluginCommandCatalog,
   {
     /**
-     * The commands clients may run: those of every enabled plugin, active or not. The
-     * generation changes only when this list does, never when a plugin activates or idles.
+     * The commands clients may run and the screens they may open: those of every enabled
+     * plugin, active or not. The generation changes only when these lists do, never when a
+     * plugin activates or idles.
      */
     readonly list: Effect.Effect<PluginCommandCatalogSnapshot>;
     readonly changes: Stream.Stream<PluginCommandCatalogSnapshot>;
     readonly publish: (
       commands: ReadonlyArray<PluginCommand>,
+      screens?: ReadonlyArray<PluginScreen>,
     ) => Effect.Effect<PluginCommandCatalogSnapshot>;
     /** Runs a listed command in its plugin, which must already be active. */
     readonly invoke: (
@@ -90,14 +100,20 @@ export class PluginCommandCatalog extends Context.Service<
 export const make = Effect.gen(function* () {
   const runtime = yield* PluginRuntime.PluginRuntime;
   const state = yield* SubscriptionRef.make<PluginCommandCatalogSnapshot>(
-    Object.freeze({ commands: Object.freeze([]), generation: 0 }),
+    Object.freeze({ commands: Object.freeze([]), screens: Object.freeze([]), generation: 0 }),
   );
 
-  const publish = (commands: ReadonlyArray<PluginCommand>) =>
+  const publish = (
+    commands: ReadonlyArray<PluginCommand>,
+    screens: ReadonlyArray<PluginScreen> = [],
+  ) =>
     SubscriptionRef.modify(state, (previous) => {
-      if (sameCommands(previous.commands, commands)) return [previous, previous];
+      if (sameCommands(previous.commands, commands) && sameScreens(previous.screens, screens)) {
+        return [previous, previous];
+      }
       const next = Object.freeze({
         commands: Object.freeze(commands.map(freezeCommand)),
+        screens: Object.freeze(screens.map(freezeScreen)),
         generation: previous.generation + 1,
       });
       return [next, next];

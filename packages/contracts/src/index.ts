@@ -29,6 +29,7 @@ export * from "./projectClone.ts";
 export * from "./pullRequest.ts";
 export * from "./pluginCommands.ts";
 export * from "./pluginPackages.ts";
+export * from "./pluginScreens.ts";
 export * from "./orchestration.ts";
 export * from "./t3ProjectFile.ts";
 export * from "./editor.ts";

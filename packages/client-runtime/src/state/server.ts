@@ -1058,6 +1058,13 @@ export function createServerEnvironmentAtoms<R, E>(
       tag: WS_METHODS.pluginPackagesStatus,
       staleTimeMs: 1_000,
     }),
+    // Keyed by revision, so a reload mints a new URL. Reusing one URL while its token is
+    // valid lets a reopened screen load from the browser cache.
+    pluginScreenUrl: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:server:plugin-screen-url",
+      tag: WS_METHODS.pluginScreensUrl,
+      staleTimeMs: 60 * 60 * 1_000,
+    }),
     resourceTelemetryHistory: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:server:resource-telemetry-history",
       tag: WS_METHODS.serverGetResourceTelemetryHistory,

@@ -91,6 +91,7 @@ import * as EnvironmentTheme from "./environmentTheme.ts";
 import * as Keybindings from "./keybindings.ts";
 import * as PluginCommandCatalog from "./plugins/PluginCommandCatalog.ts";
 import * as PluginPackageManager from "./plugins/PluginPackageManager.ts";
+import { issueScreenUrl } from "./plugins/PluginScreenAccess.ts";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
 import {
   projectActivityEvent,
@@ -2389,6 +2390,14 @@ const makeWsRpcLayer = (
           observeRpcEffect(WS_METHODS.pluginPackagesRescan, pluginPackages.rescan, {
             "rpc.aggregate": "pluginPackages",
           }),
+        [WS_METHODS.pluginScreensUrl]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.pluginScreensUrl,
+            issueScreenUrl(input).pipe(
+              Effect.provideService(PluginPackageManager.PluginPackageManager, pluginPackages),
+            ),
+            { "rpc.aggregate": "pluginScreens" },
+          ),
         [WS_METHODS.serverRefreshProviders]: (input) =>
           observeRpcEffect(
             WS_METHODS.serverRefreshProviders,
@@ -3937,6 +3946,4 @@ export const websocketRpcRouteLayer = Layer.unwrap(
       ),
     );
   }),
-).pipe(
-  Layer.provide(PluginPackageManager.layer.pipe(Layer.provideMerge(PluginCommandCatalog.layer))),
 );

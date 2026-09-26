@@ -13,6 +13,7 @@ import {
   type PluginPackageOperation,
   type PluginPackageStatus,
   type PluginPackageStatusSnapshot,
+  type PluginScreen,
 } from "@t3tools/contracts";
 import type { PluginActivationContext, PluginDefinition } from "@t3tools/plugin-runtime";
 import type { PluginManifest } from "@t3tools/plugin-runtime/manifest";
@@ -46,8 +47,14 @@ import {
 const COMMAND_CAPABILITY = "t3.commands@0";
 /** `api.storage` and `api.dataDir`. */
 const STORAGE_CAPABILITY = "t3.storage@0";
+/** `contributes.screens`, served by `PluginScreenAccess`. */
+const SCREEN_CAPABILITY = "t3.screens@0";
 /** Every host capability this T3 provides. A plugin requiring anything else fails activation. */
-const PROVIDED_CAPABILITIES: ReadonlyArray<string> = [COMMAND_CAPABILITY, STORAGE_CAPABILITY];
+const PROVIDED_CAPABILITIES: ReadonlyArray<string> = [
+  COMMAND_CAPABILITY,
+  SCREEN_CAPABILITY,
+  STORAGE_CAPABILITY,
+];
 const MAX_REASON_LENGTH = 2_000;
 /** Environment-owned plugin state, shared by every client connected to this environment. */
 const PLUGIN_STATE_FILE_NAME = "plugins.json";
@@ -91,6 +98,8 @@ interface LoadedPlugin {
   readonly cacheDirectory: string;
   /** The folder fingerprint this version was loaded from. */
   readonly fingerprint: string;
+  /** Unique per load, so clients can tell a reload of the same version apart. */
+  readonly revision: number;
 }
 
 /** One activation of a loaded version, live in the runtime. */
@@ -144,6 +153,16 @@ type EntryPointGuard = <A>(
   invoke: () => A | PromiseLike<A>,
 ) => Effect.Effect<A, PluginEntryPointError>;
 
+/** A screen of a loaded, working plugin, served from its folder in the load's cache copy. */
+export interface LiveScreen {
+  readonly version: string;
+  readonly revision: number;
+  /** The folder holding the entry; everything the screen loads must be inside it. */
+  readonly root: string;
+  /** The entry's path relative to `root`. */
+  readonly entry: string;
+}
+
 export interface PluginPackageManagerOptions {
   /** How long an async entry point may run before the plugin is marked failed. */
   readonly entryPointTimeout?: Duration.Input;
@@ -167,6 +186,25 @@ const declaredCommands = (manifest: PluginManifest): ReadonlyArray<PluginCommand
     };
   });
 };
+
+/** The manifest screens a client can open: none without `t3.screens@0` or any surface. */
+const openableScreens = (manifest: PluginManifest) =>
+  manifest.requires.includes(SCREEN_CAPABILITY) &&
+  (manifest.surfaces ?? DEFAULT_COMMAND_SURFACES).length > 0
+    ? (manifest.contributes?.screens ?? [])
+    : [];
+
+/** The screens a manifest declares, listed whether or not the plugin is active. */
+const declaredScreens = (manifest: PluginManifest, revision: number): Array<PluginScreen> =>
+  openableScreens(manifest).map((screen) => ({
+    pluginId: manifest.id,
+    id: screen.id,
+    title: screen.title.trim(),
+    placement: screen.placement,
+    scope: screen.scope,
+    surfaces: [...new Set(manifest.surfaces ?? DEFAULT_COMMAND_SURFACES)],
+    revision,
+  }));
 
 const isPromiseLike = (value: unknown): value is PromiseLike<unknown> =>
   (typeof value === "object" || typeof value === "function") &&
@@ -330,6 +368,11 @@ export class PluginPackageManager extends Context.Service<
      * loaded or last failed to load. New packages simply appear disabled.
      */
     readonly rescan: Effect.Effect<PluginPackageStatusSnapshot, PluginPackageOperationError>;
+    /**
+     * The listed screen `screenId` of `pluginId`: enabled, loaded and not failed. Screens
+     * are static files, so this never activates the plugin.
+     */
+    readonly screen: (pluginId: string, screenId: string) => Effect.Effect<LiveScreen | undefined>;
   }
 >()("t3/plugins/PluginPackageManager") {}
 
@@ -628,12 +671,31 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
         );
       }
     }
+    for (const screen of openableScreens(discovered.manifest)) {
+      const entry = resolvePackageEntrypoint(path, discovered.directory, screen.entry);
+      if (entry === undefined) {
+        return yield* operationError(
+          operation,
+          `screen ${screen.id} entry escapes the package`,
+          id,
+        );
+      }
+      const exists = yield* fileSystem.exists(entry).pipe(Effect.orElseSucceed(() => false));
+      if (!exists) {
+        return yield* operationError(
+          operation,
+          `screen ${screen.id} entry ${screen.entry} does not exist`,
+          id,
+        );
+      }
+    }
     const serverEntrypoint = discovered.manifest.entrypoints.server;
     const data = discovered.manifest.requires.includes(STORAGE_CAPABILITY)
       ? yield* dataAccessFor(id, operation)
       : undefined;
 
-    const cacheDirectory = path.join(pluginCacheDirectory, id, String(loadSequence++));
+    const revision = loadSequence++;
+    const cacheDirectory = path.join(pluginCacheDirectory, id, String(revision));
     const entrypointPath = resolvePackageEntrypoint(path, cacheDirectory, serverEntrypoint);
     if (entrypointPath === undefined) {
       return yield* operationError(operation, "entrypoints.server escapes the package", id);
@@ -693,6 +755,7 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
       data,
       cacheDirectory,
       fingerprint: packageFingerprint,
+      revision,
     } satisfies LoadedPlugin;
   });
 
@@ -714,15 +777,21 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
     };
   };
 
-  /** Lists the commands of every loaded package, except one whose loaded version failed. */
-  const publishCommands = Effect.suspend(() =>
-    catalog.publish(
-      [...loaded.values()]
-        .filter((version) => packageErrors.get(version.manifest.id)?.source !== version)
-        .sort((left, right) => left.manifest.id.localeCompare(right.manifest.id))
-        .flatMap((version) => declaredCommands(version.manifest)),
-    ),
-  );
+  /** Whether `version` is loaded and has not failed, so its commands and screens are listed. */
+  const isListed = (version: LoadedPlugin) =>
+    loaded.get(version.manifest.id) === version &&
+    packageErrors.get(version.manifest.id)?.source !== version;
+
+  /** Lists the commands and screens of every loaded package, except one whose loaded version failed. */
+  const publishCommands = Effect.suspend(() => {
+    const listed = [...loaded.values()]
+      .filter(isListed)
+      .sort((left, right) => left.manifest.id.localeCompare(right.manifest.id));
+    return catalog.publish(
+      listed.flatMap((version) => declaredCommands(version.manifest)),
+      listed.flatMap((version) => declaredScreens(version.manifest, version.revision)),
+    );
+  });
 
   /**
    * Makes `next` the loaded version of `id`, or unloads it, removing the replaced
@@ -1282,6 +1351,21 @@ export const make = Effect.fn("PluginPackageManager.make")(function* (
     disable: (id: PluginPackageId) => semaphore.withPermits(1)(disable(id)),
     reload: (id: PluginPackageId) => semaphore.withPermits(1)(transition("reload", id)),
     rescan,
+    screen: (pluginId: string, screenId: string) =>
+      Effect.sync(() => {
+        const version = loaded.get(pluginId);
+        if (version === undefined || !isListed(version)) return undefined;
+        const screen = openableScreens(version.manifest).find((entry) => entry.id === screenId);
+        if (screen === undefined) return undefined;
+        const entry = resolvePackageEntrypoint(path, version.cacheDirectory, screen.entry);
+        if (entry === undefined) return undefined;
+        return {
+          version: version.manifest.version,
+          revision: version.revision,
+          root: path.dirname(entry),
+          entry: path.basename(entry),
+        } satisfies LiveScreen;
+      }),
   } as const;
 });
 
@@ -1330,6 +1414,7 @@ const unavailableService = (
     disable: () => Effect.fail(error),
     reload: () => Effect.fail(error),
     rescan: Effect.fail(error),
+    screen: () => Effect.succeed(undefined),
   });
 
 export const layerWith = (options: PluginPackageManagerOptions = {}) =>

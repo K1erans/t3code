@@ -6,6 +6,7 @@ import {
   type KeybindingCommand,
   type PluginCommand,
   type PluginCommandSurface,
+  type PluginScreen,
   THREAD_JUMP_KEYBINDING_COMMANDS,
 } from "@t3tools/contracts";
 import { filterFilesystemBrowseEntries } from "@t3tools/client-runtime/state/filesystem";
@@ -172,6 +173,22 @@ export function buildPluginCommandActionItems(input: {
       icon: input.icon,
       run: async () => input.run(command),
     }));
+}
+
+/** One host-generated "Open <title>" entry per screen the active thread can open. */
+export function buildPluginScreenActionItems(input: {
+  readonly screens: ReadonlyArray<PluginScreen>;
+  readonly icon: ReactNode;
+  readonly open: (screen: PluginScreen) => void;
+}): CommandPaletteActionItem[] {
+  return input.screens.map((screen) => ({
+    kind: "action",
+    value: `plugin-screen:${screen.pluginId}/${screen.id}`,
+    searchTerms: [screen.title, screen.pluginId, "plugin", "open"],
+    title: `Open ${screen.title}`,
+    icon: input.icon,
+    run: async () => input.open(screen),
+  }));
 }
 
 export const resolvePluginCommandEnvironmentId = (input: {
