@@ -15,8 +15,8 @@ export const PluginPackageCapability = Schema.String.check(
 export type PluginPackageCapability = typeof PluginPackageCapability.Type;
 
 /**
- * `activating` is enabled and waiting for startup activation to reach it; `idle`
- * is enabled but not currently activated.
+ * `activating` is enabled and loading at startup or activating for a command; `idle`
+ * is enabled but not running, and activates when one of its commands runs.
  */
 export const PluginPackageState = Schema.Literals([
   "disabled",
@@ -83,6 +83,8 @@ export const PluginPackageOperation = Schema.Literals([
   "disable",
   "reload",
   "rescan",
+  "activate",
+  "deactivate",
 ]);
 export type PluginPackageOperation = typeof PluginPackageOperation.Type;
 

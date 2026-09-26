@@ -40,8 +40,24 @@ other plugins' commands and status are unaffected. A command's failure is attrib
 identity: only a failure from the version that is still active marks the package failed or retires
 it. A disposed runtime starts no new invocations.
 
-For the same reason, plugins never delay server startup. Enabled packages activate in a background
+For the same reason, plugins never delay server startup. Enabled packages load in a background
 rescan and show as Starting until they do.
+
+## Loaded is not active
+
+An enabled package is imported once per version and stays loaded; activation only creates and
+disposes its scope. Startup and rescans load packages without activating them, except `onStartup`
+ones. Running a command activates its plugin first, under the manager lock, so concurrent callers
+wait for one activation. After ten minutes with no command running or finishing, the plugin's scope
+is disposed and the next command activates the same loaded code again, since re-importing would
+leak a module copy each time. Enable and Reload activate at once so a broken `activate` shows
+immediately and a failed reload keeps the previous version live.
+
+The palette lists commands from manifests, not from registrations, so an idle plugin's commands
+appear and the catalog generation clients hold changes only when the listed commands do.
+Activation and idle shutdown never invalidate an open palette. The runtime's own generation is
+internal, and command ids must be unique across enabled plugins because nothing is registered yet
+when they are listed.
 
 ## Mobile in v0
 
