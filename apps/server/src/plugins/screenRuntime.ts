@@ -41,7 +41,7 @@ if (framed) {
     if (data.type === "t3-screen:theme") {
       applyTheme(data.appearance, data.tokens);
     } else if (data.type === "t3-screen:init") {
-      // The host answers the greeting and the frame's load event, so init can come twice.
+      // A later init (a greeting answered twice) still carries the current theme.
       applyTheme(data.context?.theme?.appearance, data.tokens);
       resolveConnection?.(Object.freeze({ context: Object.freeze(data.context) }));
       resolveConnection = undefined;

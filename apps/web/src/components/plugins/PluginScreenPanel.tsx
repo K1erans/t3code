@@ -18,7 +18,7 @@ import { type EnvironmentId, PLUGIN_SCREEN_SANDBOX, type PluginScreen } from "@t
 import * as Option from "effect/Option";
 import { AsyncResult } from "effect/unstable/reactivity";
 import { PuzzleIcon } from "lucide-react";
-import { type ReactNode, useEffect, useRef, useState } from "react";
+import { type ReactNode, useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import { Button } from "~/components/ui/button";
 import {
@@ -115,7 +115,9 @@ function PluginScreenFrame(props: {
   const { placement } = screen;
   const { projectId } = props;
 
-  useEffect(() => {
+  // A layout effect, so the listener exists in the same task that inserts the frame: the
+  // frame's greeting is a posted message, delivered in a later task, and is never missed.
+  useLayoutEffect(() => {
     // The theme the frame last received, or null until it was first sent. A page navigating
     // inside the frame is sent everything afresh.
     let lastSent: ScreenTheme | null = null;
@@ -133,16 +135,12 @@ function PluginScreenFrame(props: {
         "*",
       );
     };
-    // The runtime greets the host when it loads, or when the SDK loads it later.
+    // The runtime greets the host when it loads, or when the SDK loads it later. Only a page
+    // that greets the host is told its context.
     const onMessage = (event: MessageEvent) => {
       if (event.source == null || event.source !== frameRef.current?.contentWindow) return;
       if (typeof event.data !== "object" || event.data?.type !== "t3-screen:hello") return;
       sendInit();
-    };
-    // A greeting can come before this listener exists. Every page links the runtime as a
-    // module script, which has run by the frame's load event, so answering then never misses.
-    const onLoad = (event: Event) => {
-      if (event.target === frameRef.current) sendInit();
     };
     // Theme, appearance, contrast and text size settings all land on the root element.
     const observer = new MutationObserver(() => {
@@ -159,12 +157,9 @@ function PluginScreenFrame(props: {
       attributeFilter: ["class", "style", "data-theme-id"],
     });
     window.addEventListener("message", onMessage);
-    // Load does not bubble; a capturing listener sees it for a frame rendered later.
-    document.addEventListener("load", onLoad, true);
     return () => {
       observer.disconnect();
       window.removeEventListener("message", onMessage);
-      document.removeEventListener("load", onLoad, true);
     };
   }, [placement, projectId]);
 

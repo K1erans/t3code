@@ -83,7 +83,7 @@ describe("screen runtime", () => {
     expect(frame.root.dataset.t3Appearance).toBe("light");
   });
 
-  it("applies an init sent again on load, after the greeting was answered", async () => {
+  it("applies an init that arrives after the screen connected", async () => {
     const frame = await loadFramedRuntime();
     const context = { placement: "panel", projectId: null, theme: { appearance: "dark" } };
     frame.fromHost({ type: "t3-screen:init", context, tokens: { "--t3-color-canvas": "#000" } });
