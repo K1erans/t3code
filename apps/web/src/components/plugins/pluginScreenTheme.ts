@@ -6,24 +6,27 @@
  * roles (sidebar, toolbar, terminal, message actions) stay internal.
  */
 
-/** Public token → the T3 variable it mirrors, read where the frame sits. */
+/**
+ * Public token → the T3 variable it mirrors, read where the frame sits. Text, border and
+ * input colors use the `--contrast-*` variants T3 paints with, so the contrast setting applies.
+ */
 const MIRRORED_TOKENS: ReadonlyArray<readonly [token: string, variable: string]> = [
   ["--t3-color-canvas", "--background"],
   ["--t3-color-surface", "--card"],
   ["--t3-color-surface-raised", "--surface-raised"],
   ["--t3-color-surface-overlay", "--popover"],
-  ["--t3-color-text", "--foreground"],
-  ["--t3-color-text-muted", "--muted-foreground"],
-  ["--t3-color-border", "--border"],
-  ["--t3-color-input", "--input"],
+  ["--t3-color-text", "--contrast-foreground"],
+  ["--t3-color-text-muted", "--contrast-muted-foreground"],
+  ["--t3-color-border", "--contrast-border"],
+  ["--t3-color-input", "--contrast-input"],
   ["--t3-color-focus", "--ring"],
   // T3's solid "act now" color, shared by its buttons, switches and send button.
   ["--t3-color-accent", "--primary"],
   ["--t3-color-accent-foreground", "--primary-foreground"],
   ["--t3-color-secondary", "--secondary"],
-  ["--t3-color-secondary-foreground", "--secondary-foreground"],
+  ["--t3-color-secondary-foreground", "--contrast-secondary-foreground"],
   ["--t3-color-muted", "--muted"],
-  ["--t3-color-muted-foreground", "--muted-foreground"],
+  ["--t3-color-muted-foreground", "--contrast-muted-foreground"],
   ["--t3-color-error", "--error"],
   ["--t3-color-error-foreground", "--error-foreground"],
   ["--t3-color-error-surface", "--error-surface"],

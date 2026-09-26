@@ -118,18 +118,18 @@ function PluginScreenFrame(props: {
   useEffect(() => {
     // The theme the frame last received, or null until its runtime says hello. A page
     // navigating inside the frame says hello again and is sent everything afresh.
-    let sent: ScreenTheme | null = null;
+    let lastSent: ScreenTheme | null = null;
     const onMessage = (event: MessageEvent) => {
       const element = frameRef.current;
       const frame = element?.contentWindow;
       if (element == null || frame == null || event.source !== frame) return;
       if (typeof event.data !== "object" || event.data?.type !== "t3-screen:hello") return;
-      sent = readScreenTheme(element);
+      lastSent = readScreenTheme(element);
       frame.postMessage(
         {
           type: "t3-screen:init",
-          context: { placement, projectId, theme: { appearance: sent.appearance } },
-          tokens: sent.tokens,
+          context: { placement, projectId, theme: { appearance: lastSent.appearance } },
+          tokens: lastSent.tokens,
         },
         "*",
       );
@@ -138,10 +138,10 @@ function PluginScreenFrame(props: {
     const observer = new MutationObserver(() => {
       const element = frameRef.current;
       const frame = element?.contentWindow;
-      if (sent === null || element == null || frame == null) return;
+      if (lastSent === null || element == null || frame == null) return;
       const theme = readScreenTheme(element);
-      if (sameScreenTheme(theme, sent)) return;
-      sent = theme;
+      if (sameScreenTheme(theme, lastSent)) return;
+      lastSent = theme;
       frame.postMessage({ type: "t3-screen:theme", ...theme }, "*");
     });
     observer.observe(document.documentElement, {
